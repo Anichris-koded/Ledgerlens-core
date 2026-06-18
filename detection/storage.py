@@ -82,6 +82,22 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         "add shap_json column to risk_scores",
         "ALTER TABLE risk_scores ADD COLUMN shap_json TEXT;",
     ),
+    (
+        3,
+        "add feature_vectors table with shap cache",
+        """
+        CREATE TABLE IF NOT EXISTS feature_vectors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            features_json TEXT NOT NULL,
+            shap_json TEXT,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feature_vectors_wallet ON feature_vectors (wallet);
+        CREATE INDEX IF NOT EXISTS idx_feature_vectors_asset_pair ON feature_vectors (asset_pair);
+        """,
+    ),
 ]
 
 
