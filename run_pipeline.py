@@ -19,6 +19,7 @@ from detection.cross_pair_engine import (
     find_correlated_pairs,
     find_cross_pair_wallets,
 )
+from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
 from detection.risk_score import RiskScore
@@ -57,7 +58,9 @@ def run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
-    feature_vec_rows: list[dict] = []
+    scored_features: list[dict] = []
+    scored_wallets: list[str] = []
+    scored_pairs: list[str] = []
 
     # Pre-load all trades when running in multi-pair mode
     trades_by_pair: dict[str, pd.DataFrame] = {}
@@ -130,9 +133,19 @@ def run(
                 ml_confidence=confidence,
             )
             scores.append(score)
-            feature_vec_rows.append({"wallet": account, "asset_pair": pair_key, "features": features})
+            scored_features.append(features)
+            scored_wallets.append(account)
+            scored_pairs.append(pair_key)
 
     logger.info("Computed %d risk scores", len(scores))
+
+    # Record scored features for drift detection
+    if scored_features:
+        try:
+            record_scored_features(scored_features, scored_wallets, scored_pairs)
+        except Exception:
+            logger.exception("Failed to record scored features for drift detection")
+
     save_scores(scores)
 
     # Persist feature vectors and compute+cache SHAP values using XGBoost model.
@@ -223,6 +236,10 @@ async def async_run(
     models = load_models()
     scores: list[RiskScore] = []
 
+    scored_features: list[dict] = []
+    scored_wallets: list[str] = []
+    scored_pairs: list[str] = []
+
     async with AsyncHorizonClient(settings.horizon_url, max_concurrency=max_concurrency) as client:
         for base_asset, counter_asset in asset_pairs:
             pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
@@ -271,8 +288,19 @@ async def async_run(
                     ml_confidence=confidence,
                 )
                 scores.append(score)
+                scored_features.append(features)
+                scored_wallets.append(account)
+                scored_pairs.append(pair_key)
 
     logger.info("Computed %d risk scores", len(scores))
+
+    # Record scored features for drift detection
+    if scored_features:
+        try:
+            record_scored_features(scored_features, scored_wallets, scored_pairs)
+        except Exception:
+            logger.exception("Failed to record scored features for drift detection")
+
     save_scores(scores)
     _enqueue_webhook_alerts(scores)
     _submit_on_chain(scores)
