@@ -276,20 +276,17 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         8,
-        "add alerts table for the manipulation alert taxonomy (incl. SANDWICH_ATTACK)",
+        "add wallet_feature_states table for streaming feature store",
         """
-        CREATE TABLE IF NOT EXISTS alerts (
+        CREATE TABLE IF NOT EXISTS wallet_feature_states (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_type TEXT NOT NULL,
             wallet TEXT NOT NULL,
-            asset_pair TEXT,
-            pool_id TEXT,
-            severity INTEGER NOT NULL DEFAULT 0,
-            detail_json TEXT,
-            created_at TEXT NOT NULL
+            asset_pair TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            last_updated TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
-        CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_feature_states_key ON wallet_feature_states (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_wallet_feature_states_updated ON wallet_feature_states (last_updated);
         """,
     ),
 ]
@@ -1145,115 +1142,73 @@ def get_rings(
     ]
 
 
-def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
-    """Persist manipulation alerts to the `alerts` table.
-
-    Each dict must contain `alert_type` (an `AlertType` value or its string) and
-    `wallet`. Optional keys: `asset_pair`, `pool_id`, `severity` (0-100, default
-    0), and `detail` (any JSON-serialisable payload, stored as `detail_json`).
+def save_feature_state(state, db_path: str | None = None) -> None:
+    """Persist a WalletFeatureState to cold storage (SQLite).
+    
+    Args:
+        state: WalletFeatureState instance to persist.
+        db_path: Optional database path; uses settings.db_path if not provided.
     """
-    if not alerts:
-        return
     init_db(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
+    state_json = state.model_dump_json_compat()
     with _connect(db_path) as conn:
-        conn.executemany(
+        conn.execute(
             """
-            INSERT INTO alerts
-                (alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO wallet_feature_states
+                (wallet, asset_pair, state_json, last_updated)
+            VALUES (?, ?, ?, ?)
             """,
-            [
-                (
-                    str(getattr(a["alert_type"], "value", a["alert_type"])),
-                    a["wallet"],
-                    a.get("asset_pair"),
-                    a.get("pool_id"),
-                    int(a.get("severity", 0)),
-                    json.dumps(a["detail"]) if a.get("detail") is not None else None,
-                    a.get("created_at", ts),
-                )
-                for a in alerts
-            ],
+            (state.wallet, state.asset_pair, state_json, state.last_updated.isoformat()),
         )
         conn.commit()
 
 
-def sandwich_candidates_to_alerts(candidates: list, asset_pair: str | None = None) -> list[dict]:
-    """Map `detection.sandwich_engine.SandwichCandidate` objects to alert dicts.
-
-    Severity scales with the inflicted slippage (capped at 100). The full
-    candidate is preserved in `detail` for downstream inspection.
+def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
+    """Retrieve a WalletFeatureState from cold storage.
+    
+    Returns None if not found.
     """
-    alerts: list[dict] = []
-    for c in candidates:
-        alerts.append(
-            {
-                "alert_type": AlertType.SANDWICH_ATTACK,
-                "wallet": c.attacker,
-                "asset_pair": asset_pair,
-                "pool_id": c.pool_id,
-                "severity": int(min(abs(c.slippage_inflicted) * 100, 100)),
-                "detail": {
-                    "attacker": c.attacker,
-                    "victim": c.victim,
-                    "pool_id": c.pool_id,
-                    "buy_op_idx": c.buy_op_idx,
-                    "victim_op_idx": c.victim_op_idx,
-                    "sell_op_idx": c.sell_op_idx,
-                    "profit_xlm": c.profit_xlm,
-                    "ledger_sequence": c.ledger_sequence,
-                    "slippage_inflicted": c.slippage_inflicted,
-                },
-            }
-        )
-    return alerts
-
-
-def get_alerts(
-    alert_type: str | None = None,
-    wallet: str | None = None,
-    limit: int | None = None,
-    offset: int = 0,
-    db_path: str | None = None,
-) -> list[dict]:
-    """Return stored alerts, most recent first, optionally filtered and paginated."""
     init_db(db_path)
-    conditions: list[str] = []
-    params: list = []
-    if alert_type is not None:
-        conditions.append("alert_type = ?")
-        params.append(str(getattr(alert_type, "value", alert_type)))
-    if wallet is not None:
-        conditions.append("wallet = ?")
-        params.append(wallet)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    query = f"""
-        SELECT alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at
-        FROM alerts
-        {where}
-        ORDER BY created_at DESC, id DESC
-    """
-    if limit is not None:
-        query += " LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
     with _connect(db_path) as conn:
-        rows = conn.execute(query, tuple(params)).fetchall()
+        row = conn.execute(
+            "SELECT state_json FROM wallet_feature_states WHERE wallet = ? AND asset_pair = ?",
+            (wallet, asset_pair),
+        ).fetchone()
+    
+    if row is None:
+        return None
+    
+    from detection.feature_store import WalletFeatureState
+    return WalletFeatureState.model_validate_json_compat(row[0])
 
-    return [
-        {
-            "alert_type": row[0],
-            "wallet": row[1],
-            "asset_pair": row[2],
-            "pool_id": row[3],
-            "severity": row[4],
-            "detail": json.loads(row[5]) if row[5] is not None else None,
-            "created_at": row[6],
-        }
-        for row in rows
-    ]
+
+def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
+    """Load most recently updated feature states from cold storage and write to Redis.
+    
+    Returns the count of states promoted.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT state_json FROM wallet_feature_states
+            ORDER BY last_updated DESC
+            LIMIT ?
+            """,
+            (batch_size,),
+        ).fetchall()
+    
+    count = 0
+    from detection.feature_store import WalletFeatureState
+    for row in rows:
+        try:
+            state = WalletFeatureState.model_validate_json_compat(row[0])
+            feature_store.set_state(state)
+            count += 1
+        except Exception as e:
+            logger.error(f"Error promoting feature state: {e}")
+    
+    return count
 
 
 if __name__ == "__main__":
