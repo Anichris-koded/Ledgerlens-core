@@ -28,8 +28,25 @@ class Settings:
     temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
     _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
 
+    # Fraction of the composite risk score driven by the sandwich-attack signal
+    # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
+    # benford/ML-only blend.
+    sandwich_score_weight: float = field(
+        default_factory=lambda: float(os.getenv("SANDWICH_SCORE_WEIGHT", "0.0"))
+    )
+
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
+
+    # Feature Store (Redis hot layer + SQLite cold layer)
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    feature_store_ttl_hours: int = field(default_factory=lambda: int(os.getenv("FEATURE_STORE_TTL_HOURS", "48")))
+    feature_store_flush_interval_seconds: int = (
+        field(default_factory=lambda: int(os.getenv("FEATURE_STORE_FLUSH_INTERVAL_SECONDS", "300")))
+    )
+
+    # Streaming
+    cursor_path: str = field(default_factory=lambda: os.getenv("CURSOR_PATH", "./horizon_cursor.txt"))
 
     ledgerlens_api_url: str = field(default_factory=lambda: os.getenv("LEDGERLENS_API_URL", "http://localhost:8000"))
     score_contract_id: str = field(default_factory=lambda: os.getenv("LEDGERLENS_SCORE_CONTRACT_ID", ""))
