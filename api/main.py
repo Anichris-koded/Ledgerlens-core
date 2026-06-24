@@ -43,7 +43,7 @@ from detection.storage import (
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
-    get_feature_vector_for_wallet,
+    get_feature_vector as get_feature_vector_for_wallet,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
@@ -59,6 +59,26 @@ from detection.webhook_registry import deactivate_subscriber, list_subscribers, 
 logger = logging.getLogger("ledgerlens.api")
 
 _STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{55}$")
+
+# ---------------------------------------------------------------------------
+# Stream status state (updated by the cli.py stream loop via _stream_status_update)
+# ---------------------------------------------------------------------------
+import threading as _threading
+from collections import deque as _deque
+
+_stream_lock = _threading.Lock()
+_stream_trade_timestamps: _deque = _deque(maxlen=1000)  # timestamps of recent trades (60s window)
+_stream_active_wallets: int = 0
+_stream_last_trade_at: datetime | None = None
+
+
+def _stream_status_update(trade) -> None:
+    """Called by the stream loop on each trade to update in-memory status metrics."""
+    global _stream_active_wallets, _stream_last_trade_at
+    now = datetime.now(timezone.utc)
+    with _stream_lock:
+        _stream_trade_timestamps.append(now)
+        _stream_last_trade_at = now
 
 
 def validate_stellar_address(wallet: str) -> None:
@@ -835,3 +855,45 @@ def compliance_audit_trail(wallet: str) -> list[dict]:
     validate_stellar_address(wallet)
     return get_audit_trail(wallet)
 
+
+
+# ------------------------------------------------------------------
+# Stream status
+# ------------------------------------------------------------------
+
+@app.get("/stream/status")
+def stream_status() -> dict:
+    """Rolling stream health metrics.
+
+    Returns:
+        - ``trades_per_second``: rolling 60-second average trade ingestion rate.
+        - ``active_wallets``: number of wallets with live rolling windows (set by stream loop).
+        - ``last_trade_at``: ISO timestamp of the most recently processed trade, or ``null``.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now.replace(tzinfo=timezone.utc) if now.tzinfo else now
+    with _stream_lock:
+        recent = [t for t in _stream_trade_timestamps if (now - t).total_seconds() <= 60]
+        tps = len(recent) / 60.0
+        last_at = _stream_last_trade_at.isoformat() if _stream_last_trade_at else None
+        # active_wallets is updated by the stream loop via the RollingWindowState;
+        # we read it from the checkpoint table as a proxy when not streaming.
+        active = _stream_active_wallets
+
+    if active == 0:
+        # Fall back to DB count when the stream loop is not running in this process
+        try:
+            from detection.storage import _connect
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM rolling_window_checkpoints"
+                ).fetchone()
+                active = row[0] if row else 0
+        except Exception:
+            active = 0
+
+    return {
+        "trades_per_second": round(tps, 3),
+        "active_wallets": active,
+        "last_trade_at": last_at,
+    }

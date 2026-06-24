@@ -65,6 +65,17 @@ class Settings:
 
     # Streaming
     cursor_path: str = field(default_factory=lambda: os.getenv("CURSOR_PATH", "./horizon_cursor.txt"))
+    stream_checkpoint_interval: int = field(
+        default_factory=lambda: int(os.getenv("STREAM_CHECKPOINT_INTERVAL", "100"))
+    )
+    stream_score_delta_threshold: int = field(
+        default_factory=lambda: int(os.getenv("STREAM_SCORE_DELTA_THRESHOLD", "5"))
+    )
+    stream_window_hours: tuple[int, ...] = field(
+        default_factory=lambda: tuple(
+            int(h) for h in os.getenv("STREAM_WINDOW_HOURS", "1,4,24").split(",") if h.strip()
+        )
+    )
 
     ledgerlens_api_url: str = field(default_factory=lambda: os.getenv("LEDGERLENS_API_URL", "http://localhost:8000"))
     score_contract_id: str = field(default_factory=lambda: os.getenv("LEDGERLENS_SCORE_CONTRACT_ID", ""))

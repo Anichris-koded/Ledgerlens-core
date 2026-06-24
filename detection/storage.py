@@ -372,6 +372,19 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON path_payment_cycles (detected_at);
         """,
     ),
+    (
+        13,
+        "add rolling_window_checkpoints table for streaming scorer state",
+        """
+        CREATE TABLE IF NOT EXISTS rolling_window_checkpoints (
+            wallet      TEXT NOT NULL,
+            trades_json TEXT NOT NULL,
+            last_score  INTEGER,
+            updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (wallet)
+        );
+        """,
+    ),
 ]
 
 
