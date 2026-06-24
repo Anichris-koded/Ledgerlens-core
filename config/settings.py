@@ -130,6 +130,9 @@ class Settings:
     evm_rpc_polygon: str = field(
         default_factory=lambda: os.getenv("EVM_RPC_POLYGON", "https://polygon-rpc.com")
     )
+    evm_rpc_arbitrum: str = field(
+        default_factory=lambda: os.getenv("EVM_RPC_ARBITRUM", "https://arb1.arbitrum.io/rpc")
+    )
     evm_lookback_blocks: int = field(
         default_factory=lambda: int(os.getenv("EVM_LOOKBACK_BLOCKS", "5760"))
     )
