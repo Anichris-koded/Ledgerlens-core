@@ -58,6 +58,20 @@ class Settings:
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 
+    # Temporal train/val split parameters
+    TEMPORAL_SPLIT_VAL_RATIO: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_VAL_RATIO", "0.20"))
+    )
+    TEMPORAL_SPLIT_GAP_DAYS: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_GAP_DAYS", "7.0"))
+    )
+    TEMPORAL_SPLIT_MAX_WINDOW_DAYS: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_MAX_WINDOW_DAYS", "30.0"))
+    )
+    WALK_FORWARD_N_SPLITS: int = field(
+        default_factory=lambda: int(os.getenv("WALK_FORWARD_N_SPLITS", "5"))
+    )
+
     # Feature Store (Redis hot layer + SQLite cold layer)
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     feature_store_ttl_hours: int = field(default_factory=lambda: int(os.getenv("FEATURE_STORE_TTL_HOURS", "48")))
