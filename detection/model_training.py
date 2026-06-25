@@ -339,8 +339,6 @@ def _train_ensemble_base(
             "f1": lstm_f1,
         }
     except Exception as e:
-        import logging
-        logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
 
     # Store the applied imbalance strategy so save_models can persist it.
@@ -475,6 +473,7 @@ def save_models(
 
     version = _compute_version_hash(training_row_count, column_hash)
 
+    _causal_selected = results.get("_causal_selected_features")
     metadata = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": version,
