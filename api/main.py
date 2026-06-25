@@ -22,6 +22,7 @@ import sqlite3
 from datetime import datetime, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 
@@ -32,6 +33,19 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from config.settings import settings
+
+_stream_rate_limiter_state: dict = {
+    "bucket": None,
+    "backpressure": None,
+    "adaptive": None,
+}
+
+
+def register_rate_limiter(bucket, backpressure=None, adaptive=None) -> None:
+    """Register active rate limiter components for the /stream/rate-limiter endpoint."""
+    _stream_rate_limiter_state["bucket"] = bucket
+    _stream_rate_limiter_state["backpressure"] = backpressure
+    _stream_rate_limiter_state["adaptive"] = adaptive
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
@@ -181,6 +195,24 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Readiness probe: returns 200 when the API is ready to serve traffic.
+
+    Lightweight check — verifies DB connectivity only (models may still
+    be loading but the API can serve cached data).
+    """
+    from detection.storage import _connect
+
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1")
+        return JSONResponse(content={"status": "ready"})
+    except Exception as exc:
+        logger.error("Readiness check failed: %s", exc)
+        return JSONResponse(content={"status": "not ready"}, status_code=503)
+
+
 @app.get("/scores", response_model=list[RiskScore])
 def list_scores(
     min_score: int = 0,
@@ -248,6 +280,46 @@ def explain_wallet_score(
             detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
         )
     return cached
+
+
+class RateLimiterStatus(BaseModel):
+    configured_rate: float
+    current_rate: float
+    bucket_level: float
+    backpressure_active: bool
+    queue_size: int
+    last_429_at: Optional[datetime] = None
+
+
+@app.get(
+    "/stream/rate-limiter",
+    response_model=RateLimiterStatus,
+    dependencies=[Depends(require_admin_key)],
+)
+def rate_limiter_status() -> RateLimiterStatus:
+    """Return current rate limiter and backpressure state.
+
+    Requires the ``X-LedgerLens-Admin-Key`` header.  Returns 503 if no
+    streamer is currently registered.
+    """
+    bucket = _stream_rate_limiter_state.get("bucket")
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Rate limiter not active (no streamer running)")
+
+    bp = _stream_rate_limiter_state.get("backpressure")
+    adaptive = _stream_rate_limiter_state.get("adaptive")
+    last_429_dt: Optional[datetime] = None
+    if adaptive and adaptive.last_429_at is not None:
+        last_429_dt = datetime.fromtimestamp(adaptive.last_429_at, tz=timezone.utc)
+
+    return RateLimiterStatus(
+        configured_rate=bucket.current_rate,
+        current_rate=bucket.current_rate,
+        bucket_level=bucket.bucket_level,
+        backpressure_active=bp.is_paused if bp else False,
+        queue_size=bp.queue_size if bp else 0,
+        last_429_at=last_429_dt,
+    )
 
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5

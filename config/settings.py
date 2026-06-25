@@ -65,6 +65,17 @@ class Settings:
 
     # Streaming
     cursor_path: str = field(default_factory=lambda: os.getenv("CURSOR_PATH", "./horizon_cursor.txt"))
+    horizon_rate_limit: float = field(default_factory=lambda: float(os.getenv("HORIZON_RATE_LIMIT", "50")))
+    horizon_rate_bucket_capacity: float = field(
+        default_factory=lambda: float(os.getenv("HORIZON_RATE_BUCKET_CAPACITY", "100"))
+    )
+    horizon_queue_high_watermark: int = field(
+        default_factory=lambda: int(os.getenv("HORIZON_QUEUE_HIGH_WATERMARK", "1000"))
+    )
+    horizon_queue_low_watermark: int = field(
+        default_factory=lambda: int(os.getenv("HORIZON_QUEUE_LOW_WATERMARK", "500"))
+    )
+    rate_restore_seconds: float = field(default_factory=lambda: float(os.getenv("RATE_RESTORE_SECONDS", "60")))
 
     ledgerlens_api_url: str = field(default_factory=lambda: os.getenv("LEDGERLENS_API_URL", "http://localhost:8000"))
     score_contract_id: str = field(default_factory=lambda: os.getenv("LEDGERLENS_SCORE_CONTRACT_ID", ""))
