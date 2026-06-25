@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import AdaptiveBenfordWindow, compute_benford_metrics
+from detection.benford_engine import AdaptiveBenfordWindow, compute_benford_metrics, stratified_benford_analysis
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -46,6 +46,15 @@ BENFORD_FEATURE_NAMES = [
 # adaptively expanded or merged due to insufficient sample count.
 BENFORD_WINDOW_EXPANDED_FEATURE_NAMES = [
     f"benford_window_expanded_{window}" for window in ROLLING_WINDOWS
+]
+
+# Per-stratum Benford summary features (3 features x 5 windows = 15 new)
+BENFORD_STRATUM_FEATURE_NAMES = [
+    f"max_stratum_chi2_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"max_stratum_MAD_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"n_flagged_strata_{window}" for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -136,6 +145,7 @@ FEATURE_NAMES = (
     + CAUSAL_FEATURE_NAMES
     + MULTIVARIATE_BENFORD_FEATURE_NAMES
     + BENFORD_WINDOW_EXPANDED_FEATURE_NAMES
+    + BENFORD_STRATUM_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -187,6 +197,9 @@ def benford_features(
 ) -> dict:
     """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window.
 
+    Also computes per-stratum Benford summary features (max chi-square, max MAD,
+    and flagged strata count) for each window via ``stratified_benford_analysis``.
+
     When ``adaptive_window`` is provided the window is expanded (or merged) as
     needed to reach the configured minimum sample count, and a boolean
     ``benford_window_expanded_{label}`` flag is set for each window that was
@@ -198,6 +211,7 @@ def benford_features(
             result = adaptive_window.fit(trades, label, as_of, ROLLING_WINDOWS)
             amounts = result.trades
             features[f"benford_window_expanded_{label}"] = float(result.expanded or result.merged)
+            subset = _window_slice(trades, as_of, window)
         else:
             subset = _window_slice(trades, as_of, window)
             amounts = subset["base_amount"].tolist()
@@ -206,6 +220,11 @@ def benford_features(
         features[f"benford_chi_square_{label}"] = metrics["chi_square"]
         features[f"benford_mad_{label}"] = metrics["mad"]
         features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        summary = stratified_benford_analysis(subset)
+        features[f"max_stratum_chi2_{label}"] = summary.max_stratum_chi2
+        features[f"max_stratum_MAD_{label}"] = summary.max_stratum_MAD
+        features[f"n_flagged_strata_{label}"] = float(summary.n_flagged_strata)
     return features
 
 

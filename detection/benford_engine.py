@@ -4,6 +4,15 @@ Computes the chi-square statistic, per-digit Z-scores, and Mean Absolute
 Deviation (MAD) of the leading-digit distribution of a set of amounts,
 relative to the theoretical Benford distribution.
 
+Stratification
+--------------
+``stratified_benford_analysis()`` groups trades by canonical asset pair
+(lexicographically ordered, e.g. ``USDC/XLM`` not ``XLM/USDC``) and computes
+Benford statistics independently per stratum. Strata with fewer than 30
+observations are marked ``valid=False`` (reason ``"insufficient_sample"``).
+When *all* strata fall below the minimum, the engine falls back to a global
+(unstratified) computation and sets ``fallback_global=True`` on the summary.
+
 The univariate helpers (`compute_benford_metrics` etc.) score a single
 `(wallet, asset_pair)` stream. A coordinated wash-trading syndicate can keep
 each individual pair close to Benford while the *joint* cross-pair behaviour is
@@ -12,9 +21,14 @@ statistically impossible under independent trading. The multivariate helpers
 `multivariate_benford_score`) surface that coordination signal.
 """
 
+from __future__ import annotations
+
+import functools
 import logging
 import math
+import re
 from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -121,6 +135,211 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
 def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
     """Whether a `compute_benford_metrics` result exceeds the MAD threshold."""
     return metrics["mad"] > mad_threshold
+
+
+# ---------------------------------------------------------------------------
+# Stratified Benford analysis per asset pair
+# ---------------------------------------------------------------------------
+
+_ASSET_PAIR_RE = re.compile(r"^[A-Z0-9/.:\-]{1,30}$")
+CHI2_CRITICAL_005 = 15.507  # df=8, alpha=0.05
+MIN_STRATUM_SIZE = 30
+
+
+@dataclass
+class BenfordResult:
+    """Per-stratum Benford analysis result."""
+
+    asset_pair: str
+    chi_square: float = 0.0
+    mad: float = 0.0
+    z_scores: Dict[int, float] = field(default_factory=dict)
+    flagged_digits: List[int] = field(default_factory=list)
+    benford_flag: bool = False
+    sample_size: int = 0
+    valid: bool = True
+    reason: str = ""
+    observed_distribution: Dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class StratifiedBenfordSummary:
+    """Aggregated summary across all per-stratum Benford results."""
+
+    stratum_results: Dict[str, BenfordResult] = field(default_factory=dict)
+    max_stratum_chi2: float = 0.0
+    max_stratum_MAD: float = 0.0
+    mean_stratum_MAD: float = 0.0
+    n_strata_above_0015: int = 0
+    n_flagged_strata: int = 0
+    fallback_global: bool = False
+
+
+def _sanitize_asset_pair(pair: str) -> str | None:
+    if not pair or len(pair) > 30:
+        return None
+    if not _ASSET_PAIR_RE.match(pair.upper()):
+        return None
+    return pair
+
+
+def _canonical_asset_pair(base: str, counter: str) -> str:
+    parts = sorted([base, counter])
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _extract_digit_histogram(amounts: List[float]) -> Tuple[np.ndarray, int]:
+    """Extract a 9-element digit frequency histogram from amounts.
+
+    Returns (histogram, n_valid). Caches only the histogram, not raw amounts.
+    """
+    counts = np.zeros(9, dtype=int)
+    n = 0
+    for a in amounts:
+        if a is None or not math.isfinite(a) or a <= 0:
+            continue
+        d = first_digit(a)
+        if d is not None:
+            counts[d - 1] += 1
+            n += 1
+    return counts, n
+
+
+def compute_stratum_benford(asset_pair: str, amounts: List[float]) -> BenfordResult:
+    """Compute Benford statistics for a single asset-pair stratum."""
+    counts, n = _extract_digit_histogram(amounts)
+
+    if n < MIN_STRATUM_SIZE:
+        return BenfordResult(
+            asset_pair=asset_pair,
+            sample_size=n,
+            valid=False,
+            reason="insufficient_sample",
+        )
+
+    observed = {d: counts[d - 1] / n for d in DIGITS}
+    chi_sq = chi_square_statistic(observed, n)
+    zs = z_scores(observed, n)
+    mad_val = mean_absolute_deviation(observed)
+    flagged = [d for d in DIGITS if abs(zs.get(d, 0.0)) > 1.96]
+
+    return BenfordResult(
+        asset_pair=asset_pair,
+        chi_square=chi_sq,
+        mad=mad_val,
+        z_scores=zs,
+        flagged_digits=flagged,
+        benford_flag=chi_sq > CHI2_CRITICAL_005,
+        sample_size=n,
+        valid=True,
+        observed_distribution=observed,
+    )
+
+
+def stratified_benford_analysis(
+    trades: List | pd.DataFrame,
+    min_stratum_size: int = MIN_STRATUM_SIZE,
+) -> StratifiedBenfordSummary:
+    """Group trades by canonical asset pair and compute per-stratum Benford stats.
+
+    Accepts either a list of Trade objects (from ingestion.data_models) or a
+    DataFrame with ``base_asset``, ``counter_asset``, and ``base_amount`` columns.
+    """
+    if isinstance(trades, pd.DataFrame):
+        grouped = _group_trades_df(trades)
+    else:
+        grouped = _group_trades_list(trades)
+
+    if not grouped:
+        return StratifiedBenfordSummary(fallback_global=True)
+
+    results: Dict[str, BenfordResult] = {}
+    for pair, amounts in grouped.items():
+        results[pair] = compute_stratum_benford(pair, amounts)
+
+    valid_results = [r for r in results.values() if r.valid]
+
+    if not valid_results:
+        all_amounts: List[float] = []
+        for amounts in grouped.values():
+            all_amounts.extend(amounts)
+        global_result = compute_stratum_benford("__global__", all_amounts)
+        results["__global__"] = global_result
+        valid_results = [global_result] if global_result.valid else []
+        return StratifiedBenfordSummary(
+            stratum_results=results,
+            max_stratum_chi2=global_result.chi_square if global_result.valid else 0.0,
+            max_stratum_MAD=global_result.mad if global_result.valid else 0.0,
+            mean_stratum_MAD=global_result.mad if global_result.valid else 0.0,
+            n_strata_above_0015=1 if global_result.valid and global_result.mad > 0.015 else 0,
+            n_flagged_strata=1 if global_result.valid and global_result.benford_flag else 0,
+            fallback_global=True,
+        )
+
+    max_chi2 = max(r.chi_square for r in valid_results)
+    mads = [r.mad for r in valid_results]
+    max_mad = max(mads)
+    mean_mad = sum(mads) / len(mads)
+    n_above = sum(1 for m in mads if m > 0.015)
+    n_flagged = sum(1 for r in valid_results if r.benford_flag)
+
+    return StratifiedBenfordSummary(
+        stratum_results=results,
+        max_stratum_chi2=max_chi2,
+        max_stratum_MAD=max_mad,
+        mean_stratum_MAD=mean_mad,
+        n_strata_above_0015=n_above,
+        n_flagged_strata=n_flagged,
+        fallback_global=False,
+    )
+
+
+def _group_trades_df(trades: pd.DataFrame) -> Dict[str, List[float]]:
+    """Group a trades DataFrame by canonical asset pair."""
+    grouped: Dict[str, List[float]] = {}
+    if trades.empty:
+        return grouped
+
+    for _, row in trades.iterrows():
+        base_asset = row.get("base_asset")
+        counter_asset = row.get("counter_asset")
+        amount = row.get("base_amount")
+
+        if base_asset is None or counter_asset is None:
+            continue
+
+        if isinstance(base_asset, dict):
+            base_sym = base_asset.get("code", "")
+        else:
+            base_sym = getattr(base_asset, "pair_symbol", str(base_asset))
+
+        if isinstance(counter_asset, dict):
+            counter_sym = counter_asset.get("code", "")
+        else:
+            counter_sym = getattr(counter_asset, "pair_symbol", str(counter_asset))
+
+        pair = _canonical_asset_pair(base_sym, counter_sym)
+        if _sanitize_asset_pair(pair) is None:
+            logger.debug("Skipping unsanitizable asset pair: %s", pair)
+            continue
+
+        grouped.setdefault(pair, []).append(float(amount))
+
+    return grouped
+
+
+def _group_trades_list(trades: list) -> Dict[str, List[float]]:
+    """Group a list of Trade model objects by canonical asset pair."""
+    grouped: Dict[str, List[float]] = {}
+    for trade in trades:
+        base_sym = trade.base_asset.pair_symbol
+        counter_sym = trade.counter_asset.pair_symbol
+        pair = _canonical_asset_pair(base_sym, counter_sym)
+        if _sanitize_asset_pair(pair) is None:
+            logger.debug("Skipping unsanitizable asset pair: %s", pair)
+            continue
+        grouped.setdefault(pair, []).append(float(trade.base_amount))
+    return grouped
 
 
 # ---------------------------------------------------------------------------
