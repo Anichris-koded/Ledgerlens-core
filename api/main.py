@@ -819,7 +819,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 
 # ------------------------------------------------------------------
-# Governance
+# ZK Commitment endpoints (#147)
 # ------------------------------------------------------------------
 
 
@@ -828,7 +828,7 @@ def get_proposals():
     return [p.dict() for p in list_open_proposals()]
 
 
-class ProposalCreate(BaseModel):
+class LegacyProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
@@ -843,7 +843,7 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.dict()
 
 
-class ProposalVote(BaseModel):
+class LegacyProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
