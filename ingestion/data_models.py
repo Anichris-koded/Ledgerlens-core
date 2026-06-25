@@ -57,6 +57,7 @@ class Trade(BaseModel):
     transaction_hash: str | None = None  # links a trade back to its parent tx
     path_payment_id: str | None = None   # ID of the originating path payment operation
     hop_index: int | None = None         # position in the path (0 = first hop)
+    source: str = "stellar"              # ingestion origin: "stellar" | "solana" | ...
 
     @property
     def asset_pair(self) -> str:
