@@ -22,179 +22,62 @@ Stacking ensemble (Issue-111):
 """
 
 import logging
-
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 from detection.model_signing import sign_model_file
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import ADASYN, SMOTE, BorderlineSMOTE
+from imblearn.over_sampling.base import BaseOverSampler
 from lightgbm import LGBMClassifier
 from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
 
-_logger = logging.getLogger("ledgerlens.model_training")
+logger = logging.getLogger("ledgerlens.model_training")
 
 
-STACKING_USE_DISAGREEMENT_FEATURES: bool = True
+def _get_oversampler(strategy: str, random_state: int = 42) -> BaseOverSampler | None:
+    """Factory function returning the requested over-sampling object.
 
+    Parameters
+    ----------
+    strategy:
+        One of ``"smote"``, ``"adasyn"``, ``"borderline1"``, ``"borderline2"``,
+        or ``"none"`` (no oversampling).
+    random_state:
+        Random seed for reproducibility.
 
-def _walk_forward_cv(
-    X: np.ndarray,
-    timestamps: np.ndarray,
-    n_splits: int = 5,
-    gap_days: float = 7.0,
-):
-    """Temporal walk-forward cross-validation iterator.
+    Returns
+    -------
+    BaseOverSampler or None
+        The configured oversampler, or ``None`` when strategy is ``"none"``.
 
-    Yields (train_idx, val_idx) pairs ordered chronologically, with a
-    ``gap_days``-day purge gap between train and validation to prevent leakage.
+    Raises
+    ------
+    ValueError
+        If *strategy* is not one of the five accepted values.
     """
-    n = len(timestamps)
-    sorted_order = np.argsort(timestamps, kind="stable")
-    fold_size = n // (n_splits + 1)
-
-    for fold in range(n_splits):
-        val_start_pos = (fold + 1) * fold_size
-        val_end_pos = min(val_start_pos + fold_size, n)
-        val_positions = sorted_order[val_start_pos:val_end_pos]
-
-        if len(val_positions) == 0:
-            continue
-
-        val_time_min = timestamps[val_positions].min()
-        gap_threshold = val_time_min - gap_days * 86400  # seconds
-
-        train_positions = sorted_order[:val_start_pos]
-        train_positions = train_positions[timestamps[train_positions] < gap_threshold]
-
-        if len(train_positions) == 0:
-            continue
-
-        yield train_positions, val_positions
-
-
-def generate_oof_predictions(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    timestamps: np.ndarray,
-    base_models: dict,
-    n_splits: int = 5,
-    gap_days: float = 7.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generate out-of-fold predictions for the stacking meta-learner.
-
-    Uses temporal walk-forward cross-validation to produce OOF predictions
-    that respect the time ordering of transactions and prevent data leakage.
-
-    Args:
-        X_train: Feature matrix of shape (n, p).
-        y_train: Binary labels of shape (n,).
-        timestamps: Unix timestamps (seconds) of shape (n,).
-        base_models: Dict mapping model name to unfitted estimator instance.
-            Keys must be ``"rf"``, ``"xgb"``, ``"lgbm"`` (in that order for
-            the column layout).
-        n_splits: Number of temporal folds (default 5).
-        gap_days: Purge gap in days between train and validation (default 7).
-
-    Returns:
-        Tuple of:
-          - ``oof_proba``: shape (n_oof, 3) — OOF probabilities per base model.
-          - ``oof_labels``: shape (n_oof,) — corresponding true labels.
-
-    Raises:
-        ValueError: if a base model raises during fit or predict_proba.
-    """
-    smote = SMOTE(random_state=42)
-    model_names = list(base_models.keys())
-    oof_proba = np.zeros((len(X_train), len(model_names)))
-    oof_mask = np.zeros(len(X_train), dtype=bool)
-
-    for fold_idx, (train_idx, val_idx) in enumerate(_walk_forward_cv(X_train, timestamps, n_splits, gap_days)):
-        try:
-            X_fold_train, y_fold_train = smote.fit_resample(X_train[train_idx], y_train[train_idx])
-        except Exception:
-            X_fold_train, y_fold_train = X_train[train_idx], y_train[train_idx]
-
-        for col, (name, model_cls) in enumerate(base_models.items()):
-            try:
-                model = clone(model_cls)
-                model.fit(X_fold_train, y_fold_train)
-                proba = model.predict_proba(X_train[val_idx])[:, 1]
-                oof_proba[val_idx, col] = proba
-            except Exception as exc:
-                raise ValueError(
-                    f"generate_oof_predictions: model '{name}' failed on fold {fold_idx}: {exc}"
-                ) from exc
-        oof_mask[val_idx] = True
-
-    return oof_proba[oof_mask], y_train[oof_mask]
-
-
-def train_meta_learner(
-    oof_proba: np.ndarray,
-    oof_labels: np.ndarray,
-    use_disagreement_features: bool = STACKING_USE_DISAGREEMENT_FEATURES,
-) -> LogisticRegression:
-    """Train a logistic-regression meta-learner on OOF base-model predictions.
-
-    Optionally augments the feature set with:
-    - ``model_disagreement``: max − min across the three model predictions.
-    - ``oof_mean``: mean prediction (equal-weight baseline as a feature).
-
-    Args:
-        oof_proba: Shape (n_oof, 3) out-of-fold probabilities.
-        oof_labels: Shape (n_oof,) binary labels.
-        use_disagreement_features: Append disagreement and mean features.
-
-    Returns:
-        Fitted :class:`~sklearn.linear_model.LogisticRegression` meta-learner.
-    """
-    X_meta = oof_proba.copy()
-    if use_disagreement_features and oof_proba.shape[1] >= 2:
-        disagreement = oof_proba.max(axis=1) - oof_proba.min(axis=1)
-        mean_pred = oof_proba.mean(axis=1)
-        X_meta = np.column_stack([X_meta, disagreement, mean_pred])
-
-    unique_classes = np.unique(oof_labels)
-    if len(unique_classes) < 2:
-        _logger.warning(
-            "OOF set contains only one class (%s); meta-learner falls back to equal-weight averaging",
-            unique_classes,
-        )
+    strategy = strategy.lower()
+    if strategy == "smote":
+        return SMOTE(k_neighbors=5, sampling_strategy="minority", random_state=random_state)
+    if strategy == "adasyn":
+        return ADASYN(n_neighbors=5, sampling_strategy="minority", random_state=random_state)
+    if strategy == "borderline1":
+        return BorderlineSMOTE(k_neighbors=5, m_neighbors=10, kind="borderline-1", sampling_strategy="minority", random_state=random_state)
+    if strategy == "borderline2":
+        return BorderlineSMOTE(k_neighbors=5, m_neighbors=10, kind="borderline-2", sampling_strategy="minority", random_state=random_state)
+    if strategy == "none":
         return None
-
-    meta = LogisticRegression(
-        C=1.0,
-        max_iter=1000,
-        solver="lbfgs",
-        class_weight="balanced",
-        random_state=42,
+    raise ValueError(
+        f"Unknown imbalance_strategy {strategy!r}. "
+        "Choose from: 'smote', 'adasyn', 'borderline1', 'borderline2', 'none'."
     )
-    meta.fit(X_meta, oof_labels)
-
-    model_names = ["rf", "xgb", "lgbm"]
-    coef_str = ", ".join(
-        f"{name}={meta.coef_[0][i]:.2f}" for i, name in enumerate(model_names)
-    )
-    _logger.info("Meta-learner coefficients: %s", coef_str)
-    _logger.info("Meta-learner intercept: %.2f", float(meta.intercept_[0]))
-    return meta
-
-
-def _build_meta_features(stack_input: np.ndarray, use_disagreement: bool = STACKING_USE_DISAGREEMENT_FEATURES) -> np.ndarray:
-    """Build the meta-learner feature matrix from base model outputs."""
-    if use_disagreement and stack_input.shape[1] >= 2:
-        disagreement = stack_input.max(axis=1, keepdims=True) - stack_input.min(axis=1, keepdims=True)
-        mean_pred = stack_input.mean(axis=1, keepdims=True)
-        return np.hstack([stack_input, disagreement, mean_pred])
-    return stack_input
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -212,6 +95,7 @@ def _train_ensemble_base(
     adversarial_augment: bool = True,
     calibrate: bool = True,
     adversarial_hardening: bool = False,
+    imbalance_strategy: str = "smote",
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -229,7 +113,6 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
-    df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
@@ -274,8 +157,19 @@ def _train_ensemble_base(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
 
-    smote = SMOTE(random_state=random_state)
-    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    oversampler = _get_oversampler(imbalance_strategy, random_state=random_state)
+    if oversampler is not None:
+        X_train_res, y_train_res = oversampler.fit_resample(X_train, y_train)
+    else:
+        X_train_res, y_train_res = X_train, y_train
+    _applied_imbalance_strategy = imbalance_strategy
+
+    # Log hyperparameters
+    mlflow.log_param("random_state", random_state)
+    mlflow.log_param("adversarial_augment", adversarial_augment)
+    mlflow.log_param("calibrate", calibrate)
+    mlflow.log_param("adversarial_hardening", adversarial_hardening)
+    mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -283,17 +177,35 @@ def _train_ensemble_base(
         "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
 
+    for mname, m in models.items():
+        for key, value in m.get_params().items():
+            mlflow.log_param(f"{mname}_{key}", value)
+
     results = {}
     for name, model in models.items():
         model.fit(X_train_res, y_train_res)
         y_proba = model.predict_proba(X_test)[:, 1]
         y_pred = model.predict(X_test)
 
+        auc_roc = roc_auc_score(y_test, y_proba)
+        pr_auc = average_precision_score(y_test, y_proba)
+        f1 = f1_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0.0)
+        rec = recall_score(y_test, y_pred, zero_division=0.0)
+
+        mlflow.log_metric(f"{name}_auc_roc", auc_roc)
+        mlflow.log_metric(f"{name}_pr_auc", pr_auc)
+        mlflow.log_metric(f"{name}_f1", f1)
+        mlflow.log_metric(f"{name}_precision", prec)
+        mlflow.log_metric(f"{name}_recall", rec)
+
+        mlflow.sklearn.log_model(model, artifact_path=name, registered_model_name=None)
+
         results[name] = {
             "model": model,
-            "auc_roc": roc_auc_score(y_test, y_proba),
-            "pr_auc": average_precision_score(y_test, y_proba),
-            "f1": f1_score(y_test, y_pred),
+            "auc_roc": auc_roc,
+            "pr_auc": pr_auc,
+            "f1": f1,
         }
 
     if calibrate:
@@ -431,6 +343,8 @@ def _train_ensemble_base(
         logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
 
+    # Store the applied imbalance strategy so save_models can persist it.
+    results["_imbalance_strategy"] = _applied_imbalance_strategy
     return results
 
 
@@ -439,6 +353,77 @@ def _compute_empirical_coverage(model, X_cal, y_cal, q_hat):
     probs = model.predict_proba(X_cal)
     scores = 1.0 - probs[range(len(y_cal)), y_cal.values]
     return float((scores <= q_hat).mean())
+
+
+def compare_oversamplers(
+    df: pd.DataFrame,
+    strategies: list[str] | None = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Train the ensemble with each oversampling strategy and compare AUC-PR.
+
+    Trains RF, XGBoost, and LightGBM on the same temporal split for each
+    strategy.  AUC-PR is used as the primary metric because accuracy and
+    AUC-ROC can be misleading at high imbalance ratios.
+
+    Parameters
+    ----------
+    df:
+        Labelled feature DataFrame (must have a ``"label"`` column).
+    strategies:
+        List of strategy names to compare. Defaults to all four oversampling
+        variants: ``["smote", "adasyn", "borderline1", "borderline2"]``.
+    random_state:
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame with columns ``["strategy", "model", "auc_pr",
+        "auc_roc", "f1"]``, sorted by ``auc_pr`` descending.  The
+        ``"best_strategy"`` attribute on the returned DataFrame contains
+        the strategy name with the highest mean AUC-PR.
+    """
+    if strategies is None:
+        strategies = ["smote", "adasyn", "borderline1", "borderline2"]
+
+    rows = []
+    for strat in strategies:
+        logger.info("compare_oversamplers: training with strategy=%s", strat)
+        try:
+            results = _train_ensemble_base(
+                df,
+                random_state=random_state,
+                adversarial_augment=False,
+                calibrate=False,
+                imbalance_strategy=strat,
+            )
+            for model_name in ("random_forest", "xgboost", "lightgbm"):
+                if model_name in results:
+                    rows.append(
+                        {
+                            "strategy": strat,
+                            "model": model_name,
+                            "auc_pr": results[model_name].get("pr_auc", 0.0),
+                            "auc_roc": results[model_name].get("auc_roc", 0.0),
+                            "f1": results[model_name].get("f1", 0.0),
+                        }
+                    )
+        except Exception:
+            logger.exception("compare_oversamplers: strategy=%s failed", strat)
+
+    comparison = pd.DataFrame(rows, columns=["strategy", "model", "auc_pr", "auc_roc", "f1"])
+    comparison = comparison.sort_values("auc_pr", ascending=False).reset_index(drop=True)
+
+    if not comparison.empty:
+        mean_by_strategy = comparison.groupby("strategy")["auc_pr"].mean()
+        best = str(mean_by_strategy.idxmax())
+        comparison.attrs["best_strategy"] = best
+        logger.info("compare_oversamplers: best strategy=%s (mean AUC-PR=%.4f)", best, mean_by_strategy[best])
+    else:
+        comparison.attrs["best_strategy"] = "smote"
+
+    return comparison
 
 
 def save_models(
@@ -467,7 +452,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name == "_calib":
+        if name in ("_calib", "_imbalance_strategy"):
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -496,6 +481,7 @@ def save_models(
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "imbalance_strategy": results.get("_imbalance_strategy", "smote"),
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -503,7 +489,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name != "_calib"
+            if name not in ("_calib", "_imbalance_strategy")
         },
     }
 
@@ -609,17 +595,43 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
+from detection.mlflow_tracker import (  # noqa: E402
+    log_metrics,
+    log_training_dataset_metadata,
+    mlflow_run,
+)
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 import os  # noqa: E402
 
 
-def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", **kwargs):
+def train_ensemble(
+    df,
+    *args,
+    use_gnn: bool = False,
+    model_dir: str = "models",
+    imbalance_strategy: str = "smote",
+    experiment_name: str | None = None,
+    tracking_uri: str | None = None,
+    **kwargs,
+):
     """Wraps the base ensemble trainer, optionally pre-training a T-GNN.
+
+    When *experiment_name* or *tracking_uri* is provided (or configured via
+    environment / settings), wraps training in an MLflow run that logs
+    hyperparameters, training/validation metrics, dataset metadata, and
+    model artifacts.
 
     Args:
         use_gnn: If True, trains a T-GNN on the training graph, appends its
-            two output features to the feature matrix before SMOTE, and
+            two output features to the feature matrix before oversampling, and
             saves the checkpoint as gnn_model.pt in model_dir.
+        imbalance_strategy: Oversampling strategy to apply before training.
+            One of ``"smote"`` (default), ``"adasyn"``, ``"borderline1"``,
+            ``"borderline2"``, or ``"none"``.  See :func:`_get_oversampler`.
+        experiment_name: MLflow experiment name.  Falls back to
+            ``settings.mlflow_experiment_name`` then ``"ledgerlens-training"``.
+        tracking_uri: MLflow tracking URI.  Falls back to
+            ``MLFLOW_TRACKING_URI`` env var, then ``settings.mlflow_tracking_uri``.
     """
     gnn_features_by_wallet = {}
 
@@ -640,7 +652,44 @@ def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", 
         os.makedirs(model_dir, exist_ok=True)
         save_gnn_checkpoint(model, os.path.join(model_dir, "gnn_model.pt"))
 
-    return _train_ensemble_base(
-        df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
-        model_dir=model_dir, **kwargs
-    )
+    with mlflow_run(experiment_name=experiment_name, tracking_uri=tracking_uri) as run_id:
+        if run_id:
+            log_training_dataset_metadata(df)
+            _log_train_test_split_params(kwargs.get("random_state", 42), kwargs.get("calibrate", True))
+
+        results = _train_ensemble_base(
+            df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
+            model_dir=model_dir, imbalance_strategy=imbalance_strategy, **kwargs
+        )
+
+        if run_id:
+            log_metrics(_collect_aggregate_metrics(results))
+
+    return results
+
+
+def _collect_aggregate_metrics(results: dict) -> dict:
+    """Collect ensemble-average metrics for MLflow logging."""
+    metrics = {}
+    model_scores = {
+        "avg_auc_roc": [],
+        "avg_pr_auc": [],
+        "avg_f1": [],
+    }
+    for name, result in results.items():
+        if name == "_calib":
+            continue
+        model_scores["avg_auc_roc"].append(result.get("auc_roc", 0.0))
+        model_scores["avg_pr_auc"].append(result.get("pr_auc", 0.0))
+        model_scores["avg_f1"].append(result.get("f1", 0.0))
+
+    for key, values in model_scores.items():
+        if values:
+            metrics[key] = sum(values) / len(values)
+    return metrics
+
+
+def _log_train_test_split_params(random_state: int, calibrate: bool) -> None:
+    """Log the train/test/calibration split configuration."""
+    mlflow.log_param("test_split_ratio", 0.2)
+    mlflow.log_param("calibration_split_ratio", 0.1 if calibrate else 0.0)
