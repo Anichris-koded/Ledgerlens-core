@@ -598,6 +598,19 @@ def circular_path_payments(
     return get_circular_routes(limit=limit, offset=offset)
 
 
+@app.get("/path-cycles")
+def list_path_cycles(
+    min_score: float = Query(0.6, ge=0.0, le=1.0),
+    wallet: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+) -> list[dict]:
+    """Return detected multi-hop path-payment wash-trade cycles."""
+    from detection.storage import get_hop_payment_cycles
+    if wallet is not None:
+        validate_stellar_address(wallet)
+    return get_hop_payment_cycles(min_score=min_score, wallet=wallet, limit=limit)
+
+
 # ---------------------------------------------------------------------------
 # Feedback ingestion — admin-key gated
 # ---------------------------------------------------------------------------
