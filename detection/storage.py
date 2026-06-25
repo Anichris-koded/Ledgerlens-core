@@ -380,6 +380,23 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
+    (
+        14,
+        "add compliance_exports audit table for SAR/Travel-Rule export logging",
+        """
+        CREATE TABLE IF NOT EXISTS compliance_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_type TEXT NOT NULL,
+            wallet_hash TEXT NOT NULL,
+            asset_pairs TEXT,
+            risk_score INTEGER,
+            exported_at TEXT NOT NULL,
+            dry_run INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_compliance_exports_exported_at
+            ON compliance_exports (exported_at);
+        """,
+    ),
 ]
 
 
@@ -1767,6 +1784,52 @@ def get_hop_payment_cycles(
         }
         for r in rows
     ]
+
+
+def log_compliance_export(
+    export_type: str,
+    wallet_hash: str,
+    asset_pairs: list[str] | None = None,
+    risk_score: int | None = None,
+    dry_run: bool = False,
+    db_path: str | None = None,
+) -> None:
+    """Record that a regulatory export (SAR / Travel-Rule) occurred.
+
+    ``wallet_hash`` must already be a SHA-256 digest, not a plaintext wallet
+    address -- the table is a compliance audit trail and must not itself
+    become a source of address-to-export linkage in the clear.
+    """
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO compliance_exports
+                (export_type, wallet_hash, asset_pairs, risk_score, exported_at, dry_run)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                export_type,
+                wallet_hash,
+                json.dumps(asset_pairs) if asset_pairs else None,
+                risk_score,
+                now,
+                int(dry_run),
+            ),
+        )
+        conn.commit()
+
+
+def count_compliance_exports_since(since_iso: str, db_path: str | None = None) -> int:
+    """Count non-dry-run compliance exports recorded at or after ``since_iso``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM compliance_exports WHERE exported_at >= ? AND dry_run = 0",
+            (since_iso,),
+        ).fetchone()
+    return int(row[0])
 
 
 if __name__ == "__main__":
