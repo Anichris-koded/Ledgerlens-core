@@ -11,12 +11,43 @@ otherwise run as separate scripts/modules:
 """
 
 import logging
+import os
+import tomllib
+from pathlib import Path
 
 import typer
+
+try:
+    _version_file = Path(__file__).resolve().parent / "pyproject.toml"
+    with open(_version_file, "rb") as _vf:
+        __version__ = tomllib.load(_vf)["project"]["version"]
+except Exception:
+    __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"ledgerlens-core v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Show the version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """LedgerLens detection engine CLI."""
+    pass
 
 
 @app.command("generate-data")
@@ -54,6 +85,8 @@ def train(
     n_wash_rings: int = typer.Option(10, help="Number of wash-trading rings"),
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
+    experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
     import os
@@ -74,11 +107,16 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    results = train_ensemble(df)
+    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
+        if name == "_calib":
+            continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
     save_models(results, training_dataset_path=training_dataset_path)
+    if calibrate and "_calib" in results:
+        coverage = results["_calib"].get("coverage_avg", 0.0)
+        logger.info("Conformal calibration complete (avg coverage=%.4f)", coverage)
     logger.info("Saved models to %s", settings.model_dir)
 
 
@@ -89,6 +127,11 @@ def retrain_check(
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
+
+    Checks both PSI-based feature distribution drift and analyst-labelled
+    performance degradation. If F1 on recent feedback labels drops more than
+    5 percentage points from the training baseline, retraining is triggered
+    alongside drift-based retraining.
 
     Computes Population Stability Index (PSI) on recent scored features
     against the training reference distribution. If drift is detected
@@ -140,7 +183,30 @@ def retrain_check(
         min_drifted_features=min_drifted_features,
     )
 
-    if not drift_detected and not force_retrain:
+    # --- Performance degradation check (Issue-110) ---
+    performance_triggered = False
+    try:
+        from detection.drift_monitor import ModelDegradationAlert, PerformanceMonitor
+
+        monitor = PerformanceMonitor(db_path=settings.db_path)
+        baseline_f1: float = metadata.get("model_metrics", {}).get("random_forest", {}).get("f1", 0.0)
+        # Prefer val_f1_score when available (more representative than train split F1)
+        baseline_f1 = metadata.get("val_f1_score", baseline_f1)
+        if baseline_f1 == 0.0:
+            logger.warning("baseline F1 not available in training_metadata.json; degradation check skipped")
+        else:
+            try:
+                monitor.check_degradation(
+                    baseline_f1=baseline_f1,
+                    f1_threshold_drop=settings.performance_degradation_threshold,
+                )
+            except ModelDegradationAlert as alert:
+                logger.warning("Model degradation detected: %s — triggering retrain", alert)
+                performance_triggered = True
+    except Exception as perf_exc:
+        logger.warning("Performance degradation check failed: %s", perf_exc)
+
+    if not drift_detected and not force_retrain and not performance_triggered:
         logger.info("No drift detected; skipping retrain")
         return
 
@@ -155,16 +221,19 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    for name, result in new_results.items():
+    model_names = [k for k in new_results if k != "_calib"]
+    for name in model_names:
+        result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
     promoted = False
-    old_versions = {model_name: get_current_version(model_name, settings.model_dir) for model_name in new_results}
+    old_versions = {model_name: get_current_version(model_name, settings.model_dir) for model_name in model_names}
     auc_by_model: dict[str, tuple[float, float]] = {}
 
-    for model_name, new_result in new_results.items():
+    for model_name in model_names:
+        new_result = new_results[model_name]
         old_auc = previous_metrics.get(model_name, {}).get("auc_roc", 0.0)
         new_auc = new_result.get("auc_roc", 0.0)
         auc_by_model[model_name] = (old_auc, new_auc)
@@ -198,7 +267,7 @@ def retrain_check(
             if old_version:
                 rollback_model(model_name, old_version, settings.model_dir)
 
-    for model_name in new_results:
+    for model_name in model_names:
         old_auc, new_auc = auc_by_model[model_name]
         save_retrain_run(
             drift_report_id=drift_report_id,
@@ -277,7 +346,7 @@ def eval_robustness(
         n_normal_accounts=n_normal_accounts, n_wash_rings=n_wash_rings, ring_size=ring_size, seed=seed
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
-    baseline_results = train_ensemble(df, adversarial_augment=False)
+    baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
     baseline_models = {k: v["model"] for k, v in baseline_results.items()}
 
     logger.info("Evaluating robustness of baseline model…")
@@ -285,7 +354,7 @@ def eval_robustness(
 
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
-    adv_results = train_ensemble(df, adversarial_augment=adversarial_augment)
+    adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
     adv_models = {k: v["model"] for k, v in adv_results.items()}
 
     logger.info("Evaluating robustness of augmented model…")
@@ -325,6 +394,40 @@ def eval_robustness(
         typer.echo(f"⚠️  Target missed: adversarial training delta-AUC = {adv_delta:+.3f} (target > -0.10)")
 
 
+
+@app.command("robustness-eval")
+def robustness_eval(
+    epsilon: float = typer.Option(0.1, help="Attack L2 budget"),
+    steps: int = typer.Option(10, help="PGD steps (max 100)"),
+    n_samples: int = typer.Option(200, help="Number of samples from test split to evaluate"),
+) -> None:
+    """Run PGD attacks on the test split and produce a RobustnessReport saved to DB."""
+    if steps > 100:
+        raise typer.BadParameter("--steps cannot exceed 100 for safety")
+
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from detection.dataset import build_training_dataset
+    from detection.model_inference import load_models
+    from detection.robustness_eval import compute_robustness_report
+    from config.settings import settings
+
+    trades, account_metadata, events, labels = generate_synthetic_dataset(n_normal_accounts=50, n_wash_rings=10, ring_size=4, seed=42)
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
+
+    try:
+        models = load_models(settings.model_dir)
+    except FileNotFoundError:
+        # train a temporary ensemble for evaluation
+        from detection.model_training import train_ensemble
+
+        logger.info("No trained models found; training temporary ensemble for robustness evaluation")
+        results = train_ensemble(df, adversarial_augment=False)
+        models = {k: v["model"] for k, v in results.items()}
+
+    report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
+    typer.echo(report.model_dump_json(indent=2))
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
@@ -341,11 +444,97 @@ def serve(
 def stream(
     batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
+    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
+    score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
 ) -> None:
-    """Stream trades from Horizon SSE and score wallets in near-real-time."""
-    import run_pipeline
+    """Stream trades from Horizon SSE and score incrementally per wallet.
 
-    run_pipeline.run_streaming(batch_size=batch_size, flush_interval_seconds=flush_interval)
+    Maintains per-wallet rolling windows (1h/4h/24h), recomputes features on
+    each trade, and emits a RiskScore when the score changes by >= score_delta
+    points. Window state is checkpointed to SQLite every checkpoint_interval
+    trades. Graceful shutdown (SIGTERM/SIGINT) persists all in-memory state.
+    """
+    import signal
+    import threading
+
+    from config.settings import settings as cfg
+    from detection.feature_engineering import FeatureEngineering
+    from detection.model_inference import IncrementalScorer, ModelInference, load_models
+    from detection.rolling_window import RollingWindowState, RollingWindowStore
+    from detection.storage import init_db, save_scores
+    from detection.webhook_queue import enqueue
+    from detection.webhook_registry import get_matching_subscribers
+    from ingestion.horizon_streamer import stream_trades
+    import api.main as api_main
+
+    _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
+    _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+
+    init_db()
+    checkpoint_store = RollingWindowStore()
+    window_state = RollingWindowState()
+    checkpoint_store.load_all(window_state)
+
+    try:
+        models = load_models(cfg.model_dir)
+    except FileNotFoundError:
+        logger.error("No trained models found in %s — run `python cli.py train` first", cfg.model_dir)
+        raise typer.Exit(1)
+
+    fe = FeatureEngineering()
+    scorer = IncrementalScorer(
+        window_state=window_state,
+        feature_engineering=fe,
+        model_inference=ModelInference(models),
+        score_delta_threshold=_score_delta,
+    )
+
+    stop_event = threading.Event()
+
+    def _shutdown(signum, frame):
+        logger.info("Shutdown signal received — checkpointing all window states…")
+        checkpoint_store.save_all(scorer.window_state)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    trades_since_checkpoint = 0
+
+    logger.info(
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        _chk_interval,
+        _score_delta,
+    )
+
+    for trade in stream_trades():
+        if stop_event.is_set():
+            break
+
+        # Update stream status for /stream/status endpoint
+        api_main._stream_status_update(trade)
+        with api_main._stream_lock:
+            api_main._stream_active_wallets = scorer.window_state.active_wallets
+
+        result = scorer.score_on_trade(trade)
+        if result:
+            save_scores([result])
+            try:
+                subscribers = get_matching_subscribers(result)
+                for sub in subscribers:
+                    enqueue(sub.subscriber_id, result.model_dump(mode="json"))
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Webhook dispatch error: %s", exc)
+
+        trades_since_checkpoint += 1
+        if trades_since_checkpoint >= _chk_interval:
+            checkpoint_store.save_all(scorer.window_state)
+            trades_since_checkpoint = 0
+            logger.debug("Checkpointed %d wallet windows", scorer.window_state.active_wallets)
+
+    # Final checkpoint on clean exit
+    checkpoint_store.save_all(scorer.window_state)
+    logger.info("Stream stopped. Final checkpoint written.")
 
 
 @app.command("db-migrate")
@@ -366,6 +555,27 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("governance-close-expired")
+def governance_close_expired() -> None:
+    """Close all active governance proposals whose voting period has expired.
+
+    Tallies each expired proposal and sets its status to 'passed' or 'rejected'
+    based on the quorum rule (>50% of committee votes 'for'). Designed to be
+    called on a schedule (e.g., cron or systemd timer).
+    """
+    from detection.storage import init_db
+    from detection.governance import GovernanceEngine
+
+    init_db()
+    engine = GovernanceEngine()
+    closed = engine.close_expired()
+    if not closed:
+        typer.echo("No expired proposals to close.")
+    else:
+        for p in closed:
+            typer.echo(f"Proposal {p.id} ({p.proposal_type}): {p.status}")
 
 
 @app.command("reweight")
@@ -410,6 +620,53 @@ def reweight(
     typer.echo("Wrote updated weights to ensemble_weights.json")
 
 
+@app.command("sign-models")
+def sign_models(
+    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+) -> None:
+    """Backfill HMAC-SHA256 signatures for every .joblib in model_dir.
+
+    Idempotent: re-signs files whose content changed, skips already-valid ones.
+    Run this once against trusted committed artifacts after setting
+    LEDGERLENS_MODEL_SIGNING_KEY. Required before loading models with
+    verification enabled.
+    """
+    import glob
+
+    from config.settings import settings
+    from detection.model_signing import ModelIntegrityError, sign_model_file, verify_model_file
+
+    target_dir = model_dir or settings.model_dir
+    signing_key = settings.model_signing_key.encode()
+
+    if not signing_key:
+        typer.echo("ERROR: LEDGERLENS_MODEL_SIGNING_KEY is not set.", err=True)
+        raise typer.Exit(1)
+
+    pattern = os.path.join(target_dir, "*.joblib")
+    paths = glob.glob(pattern)
+    if not paths:
+        typer.echo(f"No .joblib files found in {target_dir}")
+        return
+
+    signed = []
+    skipped = []
+    for path in sorted(paths):
+        try:
+            verify_model_file(path, signing_key)
+            skipped.append(path)
+        except ModelIntegrityError:
+            sign_model_file(path, signing_key)
+            signed.append(path)
+
+    for path in signed:
+        logger.info("Signed: %s", path)
+    for path in skipped:
+        logger.info("Already valid, skipped: %s", path)
+
+    typer.echo(f"Signed {len(signed)} file(s), skipped {len(skipped)} already-valid file(s).")
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
@@ -420,6 +677,168 @@ def webhook_worker(
     from detection.webhook_worker import run_delivery_worker
 
     asyncio.run(run_delivery_worker(interval_seconds=interval))
+
+
+federated_app = typer.Typer(help="Federated Learning commands for exchange operators")
+app.add_typer(federated_app, name="federated")
+
+
+@federated_app.command("server")
+def federated_server(
+    host: str = typer.Option(None, help="Host to bind (default from FEDERATED_SERVER_HOST)"),
+    port: int = typer.Option(None, help="Port to bind (default from FEDERATED_SERVER_PORT)"),
+    min_participants: int = typer.Option(None, help="Minimum quorum size before aggregation"),
+) -> None:
+    """Start the federated aggregation server as a standalone process."""
+    import uvicorn
+
+    from config.settings import settings as cfg
+    from detection.federated.server import FederatedAggregationServer, federated_app as fl_app
+    import detection.federated.server as fed_server_mod
+
+    kwargs: dict = {}
+    if min_participants is not None:
+        kwargs["min_participants"] = min_participants
+    fed_server_mod._server_instance = FederatedAggregationServer(**kwargs)
+
+    bind_host = host or cfg.federated_server_host
+    bind_port = port or cfg.federated_server_port
+    logger.info("Starting federated server on %s:%d", bind_host, bind_port)
+    uvicorn.run(fl_app, host=bind_host, port=bind_port)
+
+
+@federated_app.command("join")
+def federated_join(
+    rounds: int = typer.Option(1, "--rounds", "-r", help="Number of federated rounds to participate in"),
+    data_path: str = typer.Option(None, "--data-path", help="Path to operator's private labelled CSV"),
+    server_url: str = typer.Option(None, "--server-url", help="Federated server URL"),
+    operator_id: str = typer.Option("operator-0", "--operator-id", help="Unique operator identifier"),
+) -> None:
+    """Join the federated training pool as an exchange operator.
+
+    If --data-path is omitted, a synthetic dataset is generated locally
+    (useful for testing the protocol without real private data).
+    """
+    import httpx
+    import base64
+
+    import numpy as np
+
+    from config.settings import settings as cfg
+    from detection.dataset import build_training_dataset
+    from detection.feature_engineering import FEATURE_NAMES
+    from detection.federated.client import FederatedClient, _build_public_dataset
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    server_url = server_url or f"http://{cfg.federated_server_host}:{cfg.federated_server_port}"
+
+    # Load or generate private training data
+    if data_path:
+        import pandas as pd
+        df = pd.read_csv(data_path)
+        X = df[FEATURE_NAMES].fillna(0.0).values.astype(np.float64)
+        y = df["label"].values.astype(int)
+    else:
+        logger.info("No --data-path provided; using synthetic private dataset (seed=99)")
+        trades, meta, events, labels = generate_synthetic_dataset(
+            n_normal_accounts=30, n_wash_rings=5, ring_size=3, seed=99
+        )
+        df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
+        X = df[FEATURE_NAMES].fillna(0.0).values.astype(np.float64)
+        y = df["label"].values.astype(int)
+
+    private_key = Ed25519PrivateKey.generate()
+    client = FederatedClient(operator_id=operator_id, private_key=private_key)
+
+    with httpx.Client(base_url=server_url, timeout=60.0) as http:
+        # Register with server
+        pub_der_b64 = base64.b64encode(client.public_key_der).decode()
+        resp = http.post("/federated/register", json={
+            "participant_id": operator_id,
+            "public_key_der_b64": pub_der_b64,
+        })
+        resp.raise_for_status()
+        logger.info("Registered with federated server as %s", operator_id)
+
+        X_pub = _build_public_dataset()
+        client.train_local_models(X, y)
+
+        for round_num in range(rounds):
+            # Fetch current global model
+            resp = http.get("/federated/global-model")
+            resp.raise_for_status()
+            data = resp.json()
+            round_id = data["round_id"]
+
+            if data["global_soft_labels_b64"]:
+                prev_global = np.frombuffer(
+                    base64.b64decode(data["global_soft_labels_b64"]), dtype=np.float64
+                )
+            else:
+                prev_global = np.full(len(X_pub), 0.5)
+
+            soft_labels = client.compute_soft_labels(X_pub)
+            delta = soft_labels - prev_global
+            delta = client._clip_delta(delta)
+            noisy_delta = client.inject_dp_noise(delta)
+            noisy_soft_labels = np.clip(prev_global + noisy_delta, 0.0, 1.0)
+
+            signature = client._sign_payload(noisy_soft_labels, len(y), round_id)
+
+            resp = http.post("/federated/update", json={
+                "participant_id": operator_id,
+                "soft_labels_b64": base64.b64encode(noisy_soft_labels.tobytes()).decode(),
+                "n_samples": len(y),
+                "signature_b64": base64.b64encode(signature).decode(),
+            })
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Round %d submitted: %s", round_num + 1, result)
+
+            # Wait and fetch updated global model for distillation
+            resp = http.get("/federated/global-model")
+            resp.raise_for_status()
+            data = resp.json()
+            if data["global_soft_labels_b64"]:
+                global_labels = np.frombuffer(
+                    base64.b64decode(data["global_soft_labels_b64"]), dtype=np.float64
+                )
+                client.update_with_distilled_labels(X, y, X_pub, global_labels)
+                logger.info("Round %d: distillation update applied", round_num + 1)
+
+    logger.info("Federated participation complete (%d round(s))", rounds)
+
+
+config_app = typer.Typer(help="Configuration commands")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("validate")
+def config_validate() -> None:
+    """Load and validate configuration, printing all settings (secrets masked)."""
+    import pydantic
+
+    _SECRETS = {
+        "ledgerlens_service_secret_key",
+        "ledgerlens_admin_api_key",
+        "ledgerlens_compliance_api_key",
+        "ledgerlens_model_signing_key",
+        "ledgerlens_webhook_encryption_key",
+    }
+
+    try:
+        from config.settings import Settings
+        s = Settings()
+    except (pydantic.ValidationError, Exception) as exc:
+        typer.echo(f"❌ Configuration invalid:\n{exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("✅ Configuration is valid\n")
+    for name in Settings.model_fields:
+        raw = getattr(s, name)
+        value = "***" if name in _SECRETS and raw else raw
+        typer.echo(f"  {name}={value}")
 
 
 if __name__ == "__main__":

@@ -18,13 +18,125 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+The univariate helpers (`compute_benford_metrics` etc.) score a single
+`(wallet, asset_pair)` stream. A coordinated wash-trading syndicate can keep
+each individual pair close to Benford while the *joint* cross-pair behaviour is
+statistically impossible under independent trading. The multivariate helpers
+(`joint_digit_matrix`, `benford_copula_statistic`, `cross_pair_sync_score`,
+`multivariate_benford_score`) surface that coordination signal.
+"""
+
+import logging
+import math
+from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
+from scipy.stats import chi2, norm
+
+logger = logging.getLogger("ledgerlens.benford_engine")
 
 DIGITS = list(range(1, 10))
 
+
+def _parse_benford_windows(default: list[int]) -> list[int]:
+    raw = os.getenv("BENFORD_WINDOWS", "")
+    if not raw:
+        return default
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        return default
+
+
+@dataclass
+class BenfordStats:
+    chi_square: float
+    mad: float
+    z_scores: list[float]  # length-9, index 0 = digit 1
+    n: int
+
+
+class BenfordStreamCounter:
+    """O(1) incremental Benford digit-frequency counter over configurable sliding windows.
+
+    Each window uses a circular buffer of leading digits (``deque(maxlen=window)``).
+    When a new digit enters a full window, the oldest digit is automatically evicted
+    and the per-digit tally is updated in O(1).  ``window_stats()`` iterates over
+    the 9-element tally in O(9) = O(1).
+
+    Circular buffer rollover: Python's ``collections.deque(maxlen=N)`` handles the
+    ring automatically — appending to a full deque evicts the leftmost element and
+    returns it via the ``appendleft``/``append`` mechanics, but we need the evicted
+    value to decrement the tally.  We store the raw deque and maintain a parallel
+    ``counts`` array; on each ``update`` we read ``buf[0]`` before appending when
+    the buffer is already full, then decrement that evicted digit.
+    """
+
+    BENFORD_EXPECTED = [math.log10(1 + 1 / d) for d in range(1, 10)]
+
+    def __init__(self, windows: list[int] | None = None) -> None:
+        self._windows: list[int] = _parse_benford_windows(windows or [100, 500, 1000])
+        # per-window: circular buffer of raw digits (1-9), digit count array
+        self._bufs: list[deque] = [deque(maxlen=w) for w in self._windows]
+        self._counts: list[list[int]] = [[0] * 9 for _ in self._windows]
+        # pre-built list of (buf, counts, maxlen) to avoid attribute lookups in update()
+        self._slots: list[tuple[deque, list[int], int]] = [
+            (buf, counts, w)
+            for buf, counts, w in zip(self._bufs, self._counts, self._windows)
+        ]
+
+    # ------------------------------------------------------------------
+    def update(self, amount: float) -> None:
+        """O(len(windows)) — extract the leading digit and update all tallies."""
+        if amount is None or not math.isfinite(amount) or amount <= 0:
+            return
+        # Fast leading-digit extraction via log10 — avoids the while-loop in first_digit()
+        digit = int(10 ** (math.log10(amount) % 1))
+        if digit == 0:
+            digit = 1
+        idx = digit - 1
+        for buf, counts, maxlen in self._slots:
+            if len(buf) == maxlen:
+                counts[buf[0] - 1] -= 1
+            buf.append(digit)
+            counts[idx] += 1
+
+    def window_stats(self, window: int) -> BenfordStats:
+        """Return BenfordStats for the requested window size. O(9)."""
+        try:
+            wi = self._windows.index(window)
+        except ValueError:
+            raise ValueError(f"Window {window} not in configured windows {self._windows}")
+
+        counts = self._counts[wi]
+        n = sum(counts)
+        if n == 0:
+            return BenfordStats(chi_square=0.0, mad=0.0, z_scores=[0.0] * 9, n=0)
+
+        expected = self.BENFORD_EXPECTED
+        observed = [c / n for c in counts]
+
+        chi_sq = sum(
+            (o * n - e * n) ** 2 / (e * n)
+            for o, e in zip(observed, expected)
+            if e > 0
+        )
+        mad = float(sum(abs(o - e) for o, e in zip(observed, expected)) / 9)
+
+        zs = []
+        for o, e in zip(observed, expected):
+            num = max(abs(o - e) - 1 / (2 * n), 0.0)
+            denom = math.sqrt(e * (1 - e) / n)
+            zs.append(num / denom if denom > 0 else 0.0)
+
+        return BenfordStats(chi_square=float(chi_sq), mad=mad, z_scores=zs, n=n)
+
 # P(d) = log10(1 + 1/d) for d in 1..9
 BENFORD_EXPECTED: dict[int, float] = {d: math.log10(1 + 1 / d) for d in DIGITS}
+
+# Entropy (nats) of the theoretical Benford leading-digit distribution.
+BENFORD_ENTROPY: float = float(-sum(p * math.log(p) for p in BENFORD_EXPECTED.values()))
 
 
 def first_digit(value: float) -> int | None:
@@ -315,3 +427,371 @@ class IncrementalBenfordEngine:
                 features[f"benford_mad_{name}"] = wf["mad"]
                 features[f"benford_max_zscore_{name}"] = wf["max_zscore"]
             return features
+# Adaptive window sizing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BenfordWindowResult:
+    """Result of an adaptive Benford window fit for a single target window.
+
+    Attributes
+    ----------
+    trades:
+        The trade amounts used for Benford analysis (sliced to the effective
+        window, possibly wider than the target).
+    effective_width:
+        The actual window duration used (a ``pd.Timedelta``); may be wider
+        than the target when the sample count was below ``min_sample_count``.
+    valid:
+        ``True`` when ``len(trades) >= min_sample_count`` so chi-square and
+        MAD statistics are statistically reliable.
+    expanded:
+        ``True`` when the window had to be widened beyond the target to meet
+        the minimum sample count.
+    merged:
+        ``True`` when two adjacent windows were merged because neither alone
+        reached the minimum sample count.
+    label:
+        The original target window label (e.g. ``"1h"``).
+    """
+
+    trades: list
+    effective_width: "pd.Timedelta"
+    valid: bool
+    expanded: bool
+    merged: bool
+    label: str
+
+
+class AdaptiveBenfordWindow:
+    """Adaptive rolling-window selector for Benford's Law analysis.
+
+    Ensures each window contains at least ``min_sample_count`` trades before
+    computing chi-square / MAD statistics. If the target window is too narrow,
+    the window is doubled up to ``max_window_days`` days. If even the maximum
+    window has too few trades, adjacent windows are merged.
+
+    Parameters
+    ----------
+    min_sample_count:
+        Minimum number of valid (positive, finite) trade amounts required for
+        statistically reliable Benford analysis. Default: 30.
+    max_window_days:
+        Maximum window width in days before falling back to merging. Default: 90.
+    """
+
+    def __init__(self, min_sample_count: int = 30, max_window_days: int = 90) -> None:
+        self.min_sample_count = min_sample_count
+        self.max_window_days = max_window_days
+
+    def _count_valid(self, amounts: list) -> int:
+        return sum(1 for a in amounts if first_digit(a) is not None)
+
+    def _slice_amounts(
+        self, trades: pd.DataFrame, as_of: pd.Timestamp, width: "pd.Timedelta"
+    ) -> list:
+        start = as_of - width
+        mask = (trades["ledger_close_time"] > start) & (trades["ledger_close_time"] <= as_of)
+        return trades.loc[mask, "base_amount"].tolist()
+
+    def fit(
+        self,
+        trades: pd.DataFrame,
+        target_window_label: str,
+        as_of: pd.Timestamp,
+        window_map: "dict[str, pd.Timedelta]",
+    ) -> BenfordWindowResult:
+        """Fit the adaptive window for ``target_window_label``.
+
+        Expands the window by doubling until either ``min_sample_count`` is
+        reached or ``max_window_days`` is exceeded. When neither single-window
+        expansion reaches the threshold, the *all-time* slice up to ``as_of``
+        is used and the result is marked ``merged=True``.
+
+        Parameters
+        ----------
+        trades:
+            DataFrame with ``ledger_close_time`` and ``base_amount`` columns.
+        target_window_label:
+            One of the keys in ``window_map`` (e.g. ``"1h"``).
+        as_of:
+            The reference timestamp (end of all windows).
+        window_map:
+            Mapping from window label to ``pd.Timedelta``; used to determine
+            the starting width.
+        """
+        max_width = pd.Timedelta(days=self.max_window_days)
+        target_width = window_map[target_window_label]
+
+        width = target_width
+        expanded = False
+        while True:
+            amounts = self._slice_amounts(trades, as_of, width)
+            if self._count_valid(amounts) >= self.min_sample_count:
+                if width > target_width:
+                    logger.warning(
+                        "Benford window '%s' expanded from %s to %s (sample count was below %d)",
+                        target_window_label, target_width, width, self.min_sample_count,
+                    )
+                    expanded = True
+                return BenfordWindowResult(
+                    trades=amounts,
+                    effective_width=width,
+                    valid=True,
+                    expanded=expanded,
+                    merged=False,
+                    label=target_window_label,
+                )
+            if width >= max_width:
+                break
+            width = min(width * 2, max_width)
+
+        # Neither expansion nor max_width was sufficient; use all available trades.
+        all_amounts = trades["base_amount"].tolist() if not trades.empty else []
+        valid = self._count_valid(all_amounts) >= self.min_sample_count
+        if not valid:
+            logger.warning(
+                "Benford window '%s': only %d valid trades available (min_sample_count=%d). "
+                "Statistics may be unreliable.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        else:
+            logger.warning(
+                "Benford window '%s' merged to full trade history (%d trades) "
+                "because no single expansion reached %d samples.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        return BenfordWindowResult(
+            trades=all_amounts,
+            effective_width=max_width,
+            valid=valid,
+            expanded=True,
+            merged=True,
+            label=target_window_label,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multivariate (cross-pair) Benford analysis
+#
+# A syndicate that splits wash volume evenly across N pairs keeps each pair's
+# marginal digit distribution near Benford, so the univariate MAD/chi-square
+# tests above see nothing. The coordination only shows up in the *joint*
+# distribution: the pairs deviate from Benford in the same way at the same time.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_VECTOR = np.array([BENFORD_EXPECTED[d] for d in DIGITS])
+
+
+def _pair_series(trades: pd.DataFrame) -> pd.Series:
+    """Return a per-row asset-pair label for `trades`.
+
+    Uses an explicit `asset_pair` column when present, otherwise derives the
+    pair from the `base_asset`/`counter_asset` dict columns.
+    """
+    if "asset_pair" in trades.columns:
+        return trades["asset_pair"]
+
+    def _symbol(asset: dict) -> str:
+        code = asset["code"]
+        issuer = asset.get("issuer")
+        return code if issuer is None else f"{code}:{issuer}"
+
+    return trades.apply(
+        lambda r: f"{_symbol(r['base_asset'])}/{_symbol(r['counter_asset'])}", axis=1
+    )
+
+
+def joint_digit_matrix(
+    trades: pd.DataFrame,
+    pairs: list[str],
+    window: pd.Timedelta | None = None,
+) -> np.ndarray:
+    """Build the joint leading-digit frequency matrix across `pairs`.
+
+    Returns an array of shape ``(K, 9)`` where ``K = len(pairs)`` and row ``k``
+    is the observed leading-digit frequency vector (digits 1-9) of pair ``k``'s
+    `base_amount`s. When `window` is given and `trades` carries a
+    `ledger_close_time` column, only trades within `window` of the most recent
+    trade are used. Pairs with no trades contribute an all-zero row.
+    """
+    if trades is None or trades.empty:
+        return np.zeros((len(pairs), 9))
+
+    df = trades
+    if window is not None and "ledger_close_time" in df.columns:
+        times = pd.to_datetime(df["ledger_close_time"])
+        cutoff = times.max() - window
+        df = df.loc[times > cutoff]
+
+    pair_labels = _pair_series(df)
+    matrix = np.zeros((len(pairs), 9))
+    for k, pair in enumerate(pairs):
+        amounts = df.loc[pair_labels == pair, "base_amount"].tolist()
+        dist = digit_distribution(amounts)
+        matrix[k] = [dist[d] for d in DIGITS]
+    return matrix
+
+
+def _normal_scores(row: np.ndarray) -> np.ndarray:
+    """Van der Waerden normal-score (Gaussian copula) transform of a vector."""
+    order = row.argsort()
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(row) + 1)
+    return norm.ppf(ranks / (len(row) + 1))
+
+
+def benford_copula_statistic(digit_matrix: np.ndarray) -> tuple[float, float]:
+    """Test for coordinated cross-pair digit manipulation via a Gaussian copula.
+
+    Each pair's deviation-from-Benford vector is mapped to Gaussian-copula
+    pseudo-observations (normal scores), and the cross-pair correlation matrix is
+    formed treating each pair as a variable observed over the 9 digits. Under the
+    null — rows are i.i.d. Benford draws with zero copula correlation — the
+    scaled sum of squared off-diagonal correlations is ``chi2`` distributed with
+    ``C(K, 2)`` degrees of freedom. Coordinated pairs deviate from Benford in the
+    same digit pattern, inflating the correlations and the statistic.
+
+    Returns ``(statistic, p_value)``. A small p-value => coordinated manipulation.
+    """
+    matrix = np.asarray(digit_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] < 2:
+        return 0.0, 1.0
+
+    deviations = matrix - _EXPECTED_VECTOR
+    scored = np.vstack([_normal_scores(row) for row in deviations])
+
+    corr = np.corrcoef(scored)
+    corr = np.nan_to_num(corr, nan=0.0)
+
+    k = matrix.shape[0]
+    dof_per_corr = matrix.shape[1] - 1  # 9 digits, 1 lost to the copula transform
+    upper = corr[np.triu_indices(k, k=1)]
+    statistic = float(dof_per_corr * np.sum(upper**2))
+    df = len(upper)
+    p_value = float(chi2.sf(statistic, df)) if df > 0 else 1.0
+    return statistic, p_value
+
+
+def cross_pair_sync_score(
+    trades: pd.DataFrame,
+    pairs: list[str],
+    window: pd.Timedelta = pd.Timedelta(minutes=1),
+    z_threshold: float = 2.5,
+    min_pairs: int = 3,
+) -> float:
+    """Fraction of time windows with simultaneous cross-pair digit anomalies.
+
+    Buckets `trades` into `window`-sized bins; within each active bin a pair is
+    "anomalous" when its maximum per-digit Benford Z-score exceeds `z_threshold`.
+    A bin is *synchronised* when at least `min_pairs` pairs are simultaneously
+    anomalous. Returns the fraction of active bins that are synchronised — high
+    values indicate the pairs are being manipulated in concert.
+    """
+    if trades is None or trades.empty or "ledger_close_time" not in trades.columns:
+        return 0.0
+
+    df = trades.copy()
+    df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"])
+    df = df.assign(_pair=_pair_series(df).to_numpy())
+    df = df[df["_pair"].isin(pairs)]
+    if df.empty:
+        return 0.0
+
+    df = df.assign(
+        _digit=df["base_amount"].map(first_digit),
+        _bucket=df["ledger_close_time"].dt.floor(window),
+    ).dropna(subset=["_digit"])
+    if df.empty:
+        return 0.0
+    df["_digit"] = df["_digit"].astype(int)
+
+    # Counts per (bucket, pair, digit) -> a (groups x 9) matrix, then a fully
+    # vectorised per-group Benford Z-score (matching `z_scores`).
+    counts_df = (
+        df.groupby(["_bucket", "_pair", "_digit"]).size().unstack("_digit", fill_value=0)
+    )
+    counts_df = counts_df.reindex(columns=DIGITS, fill_value=0)
+    counts = counts_df.to_numpy(dtype=float)
+    n = counts.sum(axis=1, keepdims=True)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        observed = np.divide(counts, n, out=np.zeros_like(counts), where=n > 0)
+        numerator = np.clip(np.abs(observed - _EXPECTED_VECTOR) - 1.0 / (2.0 * n), 0.0, None)
+        denominator = np.sqrt(_EXPECTED_VECTOR * (1.0 - _EXPECTED_VECTOR) / n)
+        z = np.where(denominator > 0, numerator / denominator, 0.0)
+    max_z = z.max(axis=1)
+
+    anomalous_per_bucket = (
+        pd.Series(max_z > z_threshold, index=counts_df.index.get_level_values("_bucket"))
+        .groupby(level=0)
+        .sum()
+    )
+    active_bins = len(anomalous_per_bucket)
+    sync_bins = int((anomalous_per_bucket >= min_pairs).sum())
+    return float(sync_bins / active_bins) if active_bins else 0.0
+
+
+def digit_entropy_delta(digit_matrix: np.ndarray) -> float:
+    """Observed-minus-expected leading-digit entropy of the pooled distribution.
+
+    The rows of `digit_matrix` are averaged into a single joint digit
+    distribution whose Shannon entropy (nats) is compared to Benford's. A
+    negative delta means the joint distribution is more concentrated than
+    Benford predicts — the hallmark of coordinated round-number wash volume.
+    """
+    matrix = np.asarray(digit_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.size == 0:
+        return 0.0
+
+    pooled = matrix.mean(axis=0)
+    total = pooled.sum()
+    if total <= 0:
+        return 0.0
+    pooled = pooled / total
+
+    observed_entropy = float(-sum(p * math.log(p) for p in pooled if p > 0))
+    return observed_entropy - BENFORD_ENTROPY
+
+
+def multivariate_benford_score(
+    trades: pd.DataFrame,
+    wallet_pairs: list[tuple[str, str]],
+    window: pd.Timedelta = pd.Timedelta(hours=24),
+) -> dict:
+    """Multivariate Benford entry point for a set of `(wallet, pair)` combinations.
+
+    Restricts `trades` to rows where one of the listed wallets traded one of the
+    listed pairs, then computes the cross-pair copula statistic, the synchrony
+    ratio, and the joint digit-entropy delta. Returns a dict with
+    `copula_statistic`, `copula_pval`, `sync_ratio`, `digit_entropy_delta`, and
+    the active `pairs`.
+    """
+    pairs = sorted({p for _, p in wallet_pairs})
+    zero = {
+        "copula_statistic": 0.0,
+        "copula_pval": 1.0,
+        "sync_ratio": 0.0,
+        "digit_entropy_delta": 0.0,
+        "pairs": pairs,
+    }
+    if trades is None or trades.empty or len(pairs) < 2:
+        return zero
+
+    wallets = {w for w, _ in wallet_pairs}
+    df = trades
+    base = df["base_account"] if "base_account" in df.columns else pd.Series(index=df.index, dtype=object)
+    counter = df["counter_account"] if "counter_account" in df.columns else pd.Series(index=df.index, dtype=object)
+    df = df[base.isin(wallets) | counter.isin(wallets)]
+    if df.empty:
+        return zero
+
+    matrix = joint_digit_matrix(df, pairs, window)
+    statistic, pval = benford_copula_statistic(matrix)
+    return {
+        "copula_statistic": statistic,
+        "copula_pval": pval,
+        "sync_ratio": cross_pair_sync_score(df, pairs),
+        "digit_entropy_delta": digit_entropy_delta(matrix),
+        "pairs": pairs,
+    }

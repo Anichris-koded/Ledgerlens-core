@@ -67,34 +67,31 @@ def compute_updated_weights(feedback: list[ScoringFeedback]) -> dict[str, float]
     return {m: raw[m] / total for m in _MODEL_NAMES}
 
 
-def apply_weights(weights: dict[str, float], model_dir: str) -> None:
-    """Write *weights* to ``ensemble_weights.json`` inside *model_dir*.
+def get_current_weights(
+    model_dir: str | None = None,
+    db_path: str | None = None,
+) -> dict[str, float]:
+    """Return live weights from the adaptive reweighter, falling back to the weights file."""
+    try:
+        from detection.adaptive_reweighter import get_global_reweighter, load_state
+        rw = get_global_reweighter() or load_state(db_path)
+        if rw is not None:
+            return rw.current_weights()
+    except Exception:
+        pass
 
-    Args:
-        weights: Output of :func:`compute_updated_weights`.
-        model_dir: Directory where model artefacts are stored.
-    """
-    import time
+    if model_dir is not None:
+        path = os.path.join(model_dir, _WEIGHTS_FILENAME)
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            weights = {m: data[m] for m in _MODEL_NAMES if m in data}
+            if len(weights) == len(_MODEL_NAMES):
+                return weights
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            pass
 
-    payload = {
-        "random_forest": weights["random_forest"],
-        "xgboost": weights["xgboost"],
-        "lightgbm": weights["lightgbm"],
-        "updated_at": time.time(),
-    }
-    os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, _WEIGHTS_FILENAME)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as fh:
-        json.dump(payload, fh)
-    os.replace(tmp_path, path)  # atomic rename
-    logger.info(
-        "Wrote ensemble weights: rf=%.4f xgb=%.4f lgbm=%.4f",
-        weights["random_forest"],
-        weights["xgboost"],
-        weights["lightgbm"],
-    )
-
+    return {m: 1.0 / len(_MODEL_NAMES) for m in _MODEL_NAMES}
 
 
 def apply_weights(weights: dict[str, float], model_dir: str) -> None:

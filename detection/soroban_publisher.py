@@ -3,6 +3,18 @@
 Submits RiskScore records to the ledgerlens-score Soroban contract,
 making wash-trading scores natively queryable by other Soroban contracts
 (AMMs, lending protocols, DEX aggregators).
+
+Zero-knowledge support
+----------------------
+Each submission now additionally includes:
+  - A SHA-256 commitment binding the wallet, score, and raw feature vector.
+  - A Pedersen commitment (BN254 curve point) for threshold proofs.
+  - A serialised ZK sigma-protocol proof (generated ahead of time for
+    a configurable default threshold).
+
+Downstream contracts can call ``verify_threshold(wallet, T, π)`` on
+the Soroban verifier contract to check ``score >= T`` without learning
+the raw score or any feature value.
 """
 
 from __future__ import annotations
@@ -13,10 +25,13 @@ import time
 
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
-from stellar_sdk.operation import InvokeContractFunction
 
 from detection.risk_score import RiskScore
 from detection.storage import save_submission
+from detection.zk_commitment import (
+    generate_salt,
+)
+from detection.zk_prover import generate_threshold_proof
 
 logger = logging.getLogger("ledgerlens.soroban")
 
@@ -35,6 +50,10 @@ class SorobanPublisher:
     Handles transaction construction, fee estimation via simulate_transaction,
     sequence-number management with tx_bad_seq retry, INSUFFICIENT_FEE retry,
     and a circuit breaker to prevent submission storms on contract failures.
+
+    When *features* are provided, a SHA-256 commitment and a BN254 Pedersen
+    commitment are generated and published alongside the score, enabling
+    zero-knowledge threshold verification on-chain.
     """
 
     def __init__(
@@ -46,6 +65,7 @@ class SorobanPublisher:
         circuit_breaker_threshold: int = 5,
         circuit_breaker_window: int = 60,
         circuit_reset_seconds: int = 300,
+        default_threshold: int = 70,
     ):
         self._contract_id = contract_id
         self._soroban_rpc_url = soroban_rpc_url
@@ -56,6 +76,7 @@ class SorobanPublisher:
         self._circuit_reset_seconds = circuit_reset_seconds
         self._failure_timestamps: list[float] = []
         self._lock = threading.Lock()
+        self._default_threshold = default_threshold
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -95,8 +116,18 @@ class SorobanPublisher:
     # Public API
     # ------------------------------------------------------------------
 
-    def submit_score(self, score: RiskScore, dry_run: bool = False) -> str | None:
+    def submit_score(
+        self,
+        score: RiskScore,
+        dry_run: bool = False,
+        features: dict | None = None,
+    ) -> str | None:
         """Submit a single RiskScore to the on-chain registry.
+
+        When *features* is provided, a SHA-256 commitment and BN254
+        Pedersen commitment are generated and attached to the submission
+        so that downstream contracts can verify ``score >= threshold``
+        without seeing the raw score or features.
 
         Returns the transaction hash on success, ``None`` on skip
         (``dry_run=True``).
@@ -110,13 +141,16 @@ class SorobanPublisher:
             save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open")
             raise
 
+        # Build cryptographic commitment / ZK proof bundle ---------------------------------
+        zk_bundle = self._build_zk_bundle(score, features) if features else None
+
         if dry_run:
             save_submission(score.wallet, score.asset_pair, score.score, "skipped")
             return None
 
         server = SorobanServer(self._soroban_rpc_url)
         try:
-            tx_hash = self._execute_with_retries(server, score)
+            tx_hash = self._execute_with_retries(server, score, zk_bundle=zk_bundle)
             save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
             return tx_hash
         except SorobanSubmissionError:
@@ -155,7 +189,36 @@ class SorobanPublisher:
     # Internal submission helpers
     # ------------------------------------------------------------------
 
-    def _execute_with_retries(self, server: SorobanServer, score: RiskScore) -> str:
+    def _build_zk_bundle(self, score: RiskScore, features: dict) -> dict:
+        """Generate a SHA-256 commitment + Pedersen commitment + threshold proof.
+
+        Returns a dict with keys ``commitment_hex``, ``pedersen_x``,
+        ``pedersen_y``, ``proof``, and ``salt``.
+        """
+        salt = generate_salt()
+        threshold = self._default_threshold
+
+        comm_hex, (px, py), proof = generate_threshold_proof(
+            wallet=score.wallet,
+            score=score.score,
+            features=features,
+            salt=salt,
+            threshold=threshold,
+        )
+        return {
+            "commitment_hex": comm_hex,
+            "pedersen_x": px,
+            "pedersen_y": py,
+            "proof": proof,
+            "salt": salt,
+        }
+
+    def _execute_with_retries(
+        self,
+        server: SorobanServer,
+        score: RiskScore,
+        zk_bundle: dict | None = None,
+    ) -> str:
         """Attempt submission with retry logic for transient errors.
 
         Retries once for:
@@ -166,7 +229,7 @@ class SorobanPublisher:
         Does **not** retry Soroban auth failures; raises immediately.
         """
         for attempt in range(1, 3):
-            tx_hash, error = self._submit_once(server, score, fee_multiplier=1.0)
+            tx_hash, error = self._submit_once(server, score, fee_multiplier=1.0, zk_bundle=zk_bundle)
 
             if error is None:
                 return tx_hash
@@ -185,7 +248,7 @@ class SorobanPublisher:
                     continue
                 if "insufficient_fee" in error_lower:
                     logger.warning("INSUFFICIENT_FEE, retrying with 1.5x fee")
-                    tx_hash, error = self._submit_once(server, score, fee_multiplier=1.5)
+                    tx_hash, error = self._submit_once(server, score, fee_multiplier=1.5, zk_bundle=zk_bundle)
                     if error is None:
                         return tx_hash
                     break
@@ -203,8 +266,13 @@ class SorobanPublisher:
         server: SorobanServer,
         score: RiskScore,
         fee_multiplier: float = 1.0,
+        zk_bundle: dict | None = None,
     ) -> tuple[str | None, str | None]:
         """Submit a single score without retries.
+
+        When *zk_bundle* is provided, the contract invocation is extended
+        with ``commitment_hash``, ``pedersen_x``, and ``pedersen_y`` so
+        that the on-chain verifier can later check threshold proofs.
 
         Returns ``(tx_hash, None)`` on success or ``(None, error_msg)`` on
         failure.  Callers implement retry logic.
@@ -212,16 +280,19 @@ class SorobanPublisher:
         try:
             source_account = server.load_account(self._keypair.public_key)
 
-            op = InvokeContractFunction(
-                contract_id=self._contract_id,
-                function_name="submit_score",
-                parameters=[
-                    scval.to_address(score.wallet),
-                    scval.to_symbol(score.asset_pair),
-                    scval.to_uint32(max(0, min(100, score.score))),
-                    scval.to_uint64(int(score.timestamp.timestamp())),
-                ],
-            )
+            params = [
+                scval.to_address(score.wallet),
+                scval.to_symbol(score.asset_pair),
+                scval.to_uint32(max(0, min(100, score.score))),
+                scval.to_uint64(int(score.timestamp.timestamp())),
+            ]
+
+            if zk_bundle:
+                params.extend([
+                    scval.to_string(zk_bundle["commitment_hex"]),
+                    scval.to_uint256(zk_bundle["pedersen_x"]),
+                    scval.to_uint256(zk_bundle["pedersen_y"]),
+                ])
 
             tx = (
                 TransactionBuilder(
@@ -229,7 +300,11 @@ class SorobanPublisher:
                     network_passphrase=self._network_passphrase,
                     base_fee=100,
                 )
-                .add_operation(op)
+                .append_invoke_contract_function_op(
+                    contract_id=self._contract_id,
+                    function_name="submit_score",
+                    parameters=params,
+                )
                 .build()
             )
 
