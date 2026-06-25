@@ -139,6 +139,18 @@ class Settings:
         )
     )
 
+    # Bridge event integrity verification
+    # 1.0 = verify all events (recommended for production)
+    # 0.0 = disabled (emits a WARNING on startup; cross-chain integrity not guaranteed)
+    # 0.1 = verify 10% of events (statistical sampling to reduce RPC call cost)
+    bridge_verify_sample_rate: float = field(
+        default_factory=lambda: float(os.getenv("BRIDGE_VERIFY_SAMPLE_RATE", "1.0"))
+    )
+    # Timeout (seconds) for each eth_getTransactionReceipt call during verification.
+    bridge_verify_receipt_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("BRIDGE_VERIFY_RECEIPT_TIMEOUT_SECONDS", "10.0"))
+    )
+
     def __post_init__(self) -> None:
         weights = (
             self.ensemble_weight_rf,
@@ -155,6 +167,12 @@ class Settings:
                 "Specify an explicit origin list instead."
             )
         self._validate_evm_pool_addresses()
+        if self.bridge_verify_sample_rate == 0.0:
+            import logging as _logging
+            _logging.getLogger("ledgerlens.settings").warning(
+                "Bridge event verification disabled — cross-chain integrity not guaranteed. "
+                "Set BRIDGE_VERIFY_SAMPLE_RATE > 0 to enable."
+            )
 
     def _validate_evm_pool_addresses(self) -> None:
         if not self.evm_pool_addresses:
