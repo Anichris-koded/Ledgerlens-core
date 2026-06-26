@@ -202,9 +202,17 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(
-    title="LedgerLens (local)",
-    description="Local read-only API serving RiskScore records from the detection engine.",
+    title="LedgerLens API",
+    description=(
+        "LedgerLens REST API for Stellar wallet risk scoring, alert management, "
+        "AMM pool risk, cross-chain linking, and compliance exports. "
+        "See [ReDoc](/redoc) for an alternative documentation view."
+    ),
     version="1.0.0",
+    openapi_version="3.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
     lifespan=_lifespan,
 )
 
@@ -288,7 +296,12 @@ class VoteBody(BaseModel):
 v1_router = APIRouter(prefix="/v1")
 
 
-@v1_router.get("/health")
+@v1_router.get(
+    "/health",
+    tags=["System"],
+    summary="Health check",
+    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
+)
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any hard-failure component check fails.
 
@@ -650,6 +663,9 @@ class RateLimiterStatus(BaseModel):
     "/stream/rate-limiter",
     response_model=RateLimiterStatus,
     dependencies=[Depends(require_admin_key)],
+    tags=["System"],
+    summary="Stream rate-limiter status",
+    description="Return current Horizon stream rate limiter and backpressure state (admin only).",
 )
 def rate_limiter_status() -> RateLimiterStatus:
     """Return current rate limiter and backpressure state.
@@ -681,7 +697,12 @@ _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
 
 
-@v1_router.get("/scores/{wallet}/counterfactual")
+@v1_router.get(
+    "/scores/{wallet}/counterfactual",
+    tags=["Scores"],
+    summary="Counterfactual score scenarios",
+    description="Return minimal feature changes that would lower a wallet's risk score below the target threshold.",
+)
 def wallet_counterfactual(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to generate counterfactuals for, e.g. XLM/USDC"),
@@ -810,7 +831,12 @@ def wallet_scores(wallet: str) -> dict:
     }
 
 
-@v1_router.get("/wallets/{wallet}/cross-chain")
+@v1_router.get(
+    "/wallets/{wallet}/cross-chain",
+    tags=["Wallets"],
+    summary="Cross-chain bridge history",
+    description="Return full EVM bridge transfer history for a Stellar wallet.",
+)
 def wallet_cross_chain(wallet: str) -> list[dict]:
     """Return the full bridge transfer history for ``wallet``.
 
@@ -858,7 +884,12 @@ def alerts(
 
 
 
-@v1_router.get("/assets/risk-ranking")
+@v1_router.get(
+    "/assets/risk-ranking",
+    tags=["Assets"],
+    summary="Asset pair risk ranking",
+    description="Return each asset pair ranked by average wallet risk score, descending.",
+)
 def asset_risk_ranking() -> list[dict]:
     """Return each asset pair ranked by its average wallet risk score (descending)."""
     scores = get_latest_scores()
@@ -873,13 +904,23 @@ def asset_risk_ranking() -> list[dict]:
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
 
 
-@v1_router.get("/rings")
+@v1_router.get(
+    "/rings",
+    tags=["Detection"],
+    summary="Wash-trading rings",
+    description="Return detected wash-trading rings from the latest pipeline run.",
+)
 def list_rings() -> list[dict]:
     """Return detected wash-trading rings from the latest pipeline run."""
     return get_rings()
 
 
-@v1_router.get("/correlations")
+@v1_router.get(
+    "/correlations",
+    tags=["Detection"],
+    summary="Correlated asset pairs",
+    description="Return correlated asset pairs with Spearman coefficient, shared wallet count, and run timestamp.",
+)
 def list_correlations() -> list[dict]:
     """Return the most recent set of correlated asset pairs from the pipeline.
 
@@ -931,7 +972,12 @@ def pool_risk(pool_id: str) -> dict:
     return {"pool_id": pool_id, **risk}
 
 
-@v1_router.get("/path-payments/circular")
+@v1_router.get(
+    "/path-payments/circular",
+    tags=["Detection"],
+    summary="Circular path payments",
+    description="Return detected atomic circular path-payment routes, paginated.",
+)
 def circular_path_payments(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -965,7 +1011,13 @@ class FeedbackRequest(BaseModel):
     scored_at: str     # ISO-8601 datetime of the scoring event
 
 
-@v1_router.post("/feedback", dependencies=[Depends(require_admin_key)])
+@v1_router.post(
+    "/feedback",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Admin"],
+    summary="Submit scoring feedback",
+    description="Record ground-truth feedback (confirmed wash / confirmed clean) for a previously scored wallet.",
+)
 def submit_feedback(body: FeedbackRequest) -> dict:
     """Record ground-truth feedback for a previously scored wallet/asset_pair.
 
@@ -1129,7 +1181,13 @@ def model_weights() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.post("/webhooks", status_code=201)
+@v1_router.post(
+    "/webhooks",
+    status_code=201,
+    tags=["Webhooks"],
+    summary="Register webhook subscriber",
+    description="Register a URL to receive risk score alert notifications above a configurable threshold.",
+)
 def create_webhook(body: WebhookCreate) -> dict:
     """Register a new webhook subscriber."""
     try:
@@ -1145,7 +1203,7 @@ def create_webhook(body: WebhookCreate) -> dict:
     return {"subscriber_id": subscriber_id}
 
 
-@v1_router.get("/webhooks")
+@v1_router.get("/webhooks", tags=["Webhooks"], summary="List webhooks", description="Return all active webhook subscribers (secrets masked).")
 def list_webhooks() -> list[dict]:
     """Return all active subscribers (secrets are masked)."""
     return [
@@ -1162,7 +1220,7 @@ def list_webhooks() -> list[dict]:
     ]
 
 
-@v1_router.delete("/webhooks/{subscriber_id}")
+@v1_router.delete("/webhooks/{subscriber_id}", tags=["Webhooks"], summary="Delete webhook", description="Permanently deactivate a webhook subscriber.")
 def delete_webhook(subscriber_id: str) -> dict:
     """Deactivate a webhook subscriber."""
     if not deactivate_subscriber(subscriber_id):
@@ -1170,7 +1228,7 @@ def delete_webhook(subscriber_id: str) -> dict:
     return {"status": "deactivated"}
 
 
-@v1_router.get("/webhooks/dead-letters")
+@v1_router.get("/webhooks/dead-letters", tags=["Webhooks"], summary="Dead-letter webhooks", description="Return webhook deliveries that permanently failed after all retry attempts.")
 def dead_letters() -> list[dict]:
     """Return all deliveries that have permanently failed."""
     return [
@@ -1253,7 +1311,7 @@ def gnn_stats() -> dict:
 # ------------------------------------------------------------------
 
 
-@v1_router.post("/disputes", status_code=201)
+@v1_router.post("/disputes", status_code=201, tags=["Disputes"], summary="Submit score dispute", description="Submit a dispute for a scored wallet. Rate-limited to one dispute per wallet per 24h.")
 def create_dispute(body: DisputeCreate):
     try:
         dispute = submit_dispute(body.wallet, body.asset_pair, body.evidence_url)
@@ -1265,7 +1323,7 @@ def create_dispute(body: DisputeCreate):
     return dispute.model_dump()
 
 
-@v1_router.get("/disputes/{dispute_id}")
+@v1_router.get("/disputes/{dispute_id}", tags=["Disputes"], summary="Get dispute", description="Return dispute details including committee vote counts (identities hidden).")
 def read_dispute(dispute_id: str):
     d = get_dispute(dispute_id)
     if d is None:
@@ -1288,7 +1346,7 @@ def read_dispute(dispute_id: str):
     }
 
 
-@v1_router.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)])
+@v1_router.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Disputes"], summary="Vote on dispute", description="Cast an approve/reject vote on an open dispute (admin only).")
 def vote_dispute(dispute_id: str, body: VoteBody):
     # validate voter_key_hash format
     if len(body.voter_key_hash) != 64:
@@ -1307,7 +1365,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 # ------------------------------------------------------------------
 
 
-@v1_router.get("/governance/proposals")
+@v1_router.get("/governance/proposals", tags=["Governance"], summary="List proposals", description="Return all open governance proposals.")
 def get_proposals():
     return [p.model_dump() for p in list_open_proposals()]
 
@@ -1317,8 +1375,10 @@ class LegacyProposalCreate(BaseModel):
     proposed_value: str
     proposed_by_key_hash: str
 
+ProposalCreate = LegacyProposalCreate
 
-@v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
+
+@v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Create proposal", description="Create a new governance proposal (admin only).")
 def create_proposal_endpoint(body: ProposalCreate):
     try:
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
@@ -1331,8 +1391,10 @@ class LegacyProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
+ProposalVote = LegacyProposalVote
 
-@v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
+
+@v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Vote on proposal", description="Cast a vote on a governance proposal (admin only).")
 def vote_proposal(proposal_id: str, body: ProposalVote):
     try:
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
