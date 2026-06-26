@@ -382,30 +382,23 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         14,
-        "add idempotent historical trades table",
+        "add soroban_dead_letters table for DLQ",
         """
-        CREATE TABLE IF NOT EXISTS trades (
-            paging_token TEXT PRIMARY KEY,
-            trade_id TEXT NOT NULL,
-            ledger_close_time TEXT NOT NULL,
-            base_account TEXT NOT NULL,
-            counter_account TEXT,
-            base_asset_code TEXT NOT NULL,
-            base_asset_issuer TEXT,
-            counter_asset_code TEXT NOT NULL,
-            counter_asset_issuer TEXT,
-            base_amount REAL NOT NULL,
-            counter_amount REAL NOT NULL,
-            price REAL NOT NULL,
-            base_is_seller INTEGER NOT NULL,
-            trade_type TEXT NOT NULL,
-            liquidity_pool_id TEXT,
-            transaction_hash TEXT,
-            path_payment_id TEXT,
-            hop_index INTEGER
+        CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet          TEXT NOT NULL,
+            asset_pair      TEXT NOT NULL,
+            score           INTEGER NOT NULL,
+            ledger_timestamp INTEGER NOT NULL,
+            error_message   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'replayed', 'failed')),
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            replayed_at     TIMESTAMP,
+            replay_tx_hash  TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_trades_close_time
-            ON trades (ledger_close_time);
+        CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+        CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
 ]
